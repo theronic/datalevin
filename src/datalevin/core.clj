@@ -1071,9 +1071,33 @@ Only usable for debug output.
   reader age in milliseconds."}
   active-read-snapshot-info db/active-read-snapshot-info)
 
+(def ^{:arglists '([])
+       :doc      "Return the embedded fork's executable write-policy and
+  commit-generation capability descriptor."}
+  write-policy-capabilities conn/write-policy-capabilities)
+
+(def ^{:arglists '([conn])
+       :doc      "Return the normalized persisted Datalog write policy, or nil."}
+  write-policy conn/write-policy)
+
+(def ^{:arglists '([conn policy] [conn policy tx-meta])
+       :doc      "Install or replace a persisted Datalog write policy. The
+  result contains the per-open admission token used in transaction metadata."}
+  install-write-policy! conn/install-write-policy!)
+
+(def ^{:arglists '([conn token f])
+       :doc      "Run a synchronous administrative operation with a validated
+  per-open write-policy token. Datalog transactions use tx-meta instead."}
+  with-write-policy-token conn/with-write-policy-token)
+
 (def ^{:arglists '([conn])
        :doc      "Return the option map of the Datalog DB"}
   opts conn/opts)
+
+(def ^{:arglists '([conn])
+       :doc      "Refresh a local connection DB wrapper from its shared Store.
+  Intended for bounded retry after :datalevin/stale-generation."}
+  refresh-connection! conn/refresh-connection!)
 
 (def ^{:arglists '([conn])
        :doc      "Return the schema of Datalog DB"}

@@ -22,6 +22,7 @@
    [datalevin.validate :as vld]
    [datalevin.scan :as scan]
    [datalevin.read-transaction :as read-tx]
+   [datalevin.write-policy :as write-policy]
    [datalevin.interface :as i
     :refer [IList ILMDB IAdmin open-dbi close-kv env-dir close-vecs
             transact-kv get-range stat key-compressor
@@ -46,7 +47,7 @@
    [java.util.concurrent.atomic AtomicBoolean]
    [java.lang AutoCloseable]
    [java.io File]
-   [java.util Iterator HashMap ArrayDeque Arrays Comparator List Map$Entry]
+   [java.util Iterator HashMap ArrayDeque Arrays Comparator List Map$Entry UUID]
    [java.util.function Supplier]
    [java.nio BufferOverflowException ByteBuffer]
    [org.bytedeco.javacpp SizeTPointer LongPointer]
@@ -1556,6 +1557,7 @@
 
   (clear-dbi [this dbi-name]
     (.check-ready this)
+    (write-policy/assert-admin-admitted! info :clear-dbi dbi-name)
     (try
       (let [^Dbi dbi (.-db ^DBI (.get-dbi this dbi-name))
             ^Txn txn (Txn/create env)]
@@ -1572,6 +1574,7 @@
 
   (drop-dbi [this dbi-name]
     (.check-ready this)
+    (write-policy/assert-admin-admitted! info :drop-dbi dbi-name)
     (try
       (let [^Dbi dbi (.-db ^DBI (.get-dbi this dbi-name))
             ^Txn txn (Txn/create env)]
@@ -2064,7 +2067,9 @@
     (scan/visit-list-sample this dbi-name indices visitor k-range kt vt raw-pred?))
 
   IAdmin
-  (re-index [this opts] (l/re-index* this opts)))
+  (re-index [this opts]
+    (write-policy/assert-admin-admitted! info :re-index)
+    (l/re-index* this opts)))
 
 (defn invalidate-thread-reader!
   [lmdb]
@@ -2281,6 +2286,10 @@
             (register-shutdown-hook!
               dir (Thread. #(run-shutdown-close! dir lmdb)))
             (start-scheduled-sync (.-scheduled-sync lmdb) dir env)))
+        (vswap! (.-info lmdb)
+                assoc
+                write-policy/runtime-token-key (UUID/randomUUID)
+                write-policy/runtime-write-unusable-key (AtomicBoolean. false))
         (register-local-kv-handle! local-handle-key (l/wrap-open-kv lmdb)))
       (catch Exception e
         (release-local-kv-handle! local-handle-key)

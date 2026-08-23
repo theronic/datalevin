@@ -415,14 +415,22 @@
                       (vreset! prepared-store store1)
                       (let [[report info] (db/stamp-blind-local-tx
                                             db1 prepared tx-meta)]
-                        (db/commit-prepared-tx-data! db1 (:tx-data report))
+                        (db/commit-prepared-tx-data!
+                         db1 (:tx-data report) report)
                         [report info])))
                   new-store      ^Store (s/transfer ^Store @prepared-store kv)
+                  _              (s/adopt-committed-datom-state!
+                                   store
+                                   (i/schema new-store)
+                                   (i/max-gt new-store)
+                                   (long (or (i/last-modified new-store) 0)))
+                  _              (s/sync-max-tx-floor!
+                                   store (i/max-tx new-store))
                   new-info       (assoc info :last-modified
                                         (long (or (i/last-modified new-store)
                                                   0)))
                   new-db         (db/carry-runtime-opts
-                                   (db/new-db new-store new-info)
+                                   (db/new-db store new-info)
                                    db)]
               (reset! conn new-db)
               (assoc report :db-after @conn))
@@ -698,6 +706,24 @@
   {:pre [(conn? conn)]}
   @conn)
 
+(defn refresh-connection!
+  "Refresh a local connection's immutable DB wrapper from its shared Store.
+
+  Distinct connection atoms may share one local Store. A commit through one
+  atom advances the Store while another atom still carries the older max-tx
+  used during transaction preparation. Callers use this after a pre-commit
+  stale-generation rejection before replanning."
+  [conn]
+  {:pre [(conn? conn)]}
+  (locking conn
+    (let [current ^DB @conn
+          store (.-store current)]
+      (if (instance? Store store)
+        (let [fresh (db/carry-runtime-opts (db/new-db store) current)]
+          (reset! conn fresh)
+          fresh)
+        current))))
+
 (defn opts
   [conn]
   (let [store (.-store ^DB @conn)
@@ -730,6 +756,27 @@
       {:type :datalevin/invalid-schema-source
        :source-class (some-> conn-or-db class str)}))))
 
+(defn write-policy-capabilities
+  []
+  (s/write-policy-capabilities))
+
+(defn write-policy
+  [conn]
+  {:pre [(conn? conn)]}
+  (s/persisted-write-policy (.-store ^DB @conn)))
+
+(defn install-write-policy!
+  ([conn policy]
+   (install-write-policy! conn policy nil))
+  ([conn policy tx-meta]
+   {:pre [(conn? conn)]}
+   (s/install-write-policy! (.-store ^DB @conn) policy tx-meta)))
+
+(defn with-write-policy-token
+  [conn token f]
+  {:pre [(conn? conn) (ifn? f)]}
+  (s/with-write-policy-token (.-store ^DB @conn) token f))
+
 (defn secondary-index-status
   [conn]
   {:pre [(conn? conn)]}
@@ -751,15 +798,22 @@
 
 (defn update-schema
   ([conn schema-update]
-   (update-schema conn schema-update nil nil))
+   (update-schema conn schema-update nil nil nil))
   ([conn schema-update del-attrs]
-   (update-schema conn schema-update del-attrs nil))
+   (update-schema conn schema-update del-attrs nil nil))
   ([conn schema-update del-attrs rename-map]
+   (update-schema conn schema-update del-attrs rename-map nil))
+  ([conn schema-update del-attrs rename-map tx-meta]
    {:pre [(conn? conn)]}
    (vld/validate-schema-update schema-update)
    (let [^DB db       (db conn)
          ^Store store (.-store db)
-         result       (i/set-schema store schema-update del-attrs rename-map)]
+         submit        #(i/set-schema store schema-update del-attrs rename-map)
+         result
+         (if (contains? tx-meta :datalevin/write-token)
+           (s/with-write-policy-token
+            store (:datalevin/write-token tx-meta) submit)
+           (submit))]
      ;; A value-type update can re-encode stored datoms without going through
      ;; the normal Datalog transaction cache invalidation path.
      (db/refresh-cache store)

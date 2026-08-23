@@ -21,6 +21,7 @@
    [datalevin.db :as db]
    [datalevin.datom :as dd]
    [datalevin.lmdb :as l]
+   [datalevin.write-policy :as write-policy]
    [datalevin.interface :as i :refer [dir]])
   (:import
    [datalevin.db DB]
@@ -438,6 +439,8 @@
        (let [store (.-store ^DB @db)]
          (if (instance? DatalogStore store)
            (do (i/re-index store schema opts) db)
-           (do (when bk (copy @db bk true))
+           (do (write-policy/assert-admin-admitted!
+                (i/kv-info (.-lmdb ^Store store)) :re-index)
+               (when bk (copy @db bk true))
                (re-index-datalog db schema opts))))
        (i/re-index db opts)))))

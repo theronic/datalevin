@@ -749,9 +749,21 @@
       [(allocate-eid tx-time report e (current-tx report))
        (cons [op (current-tx report) a v] entities)]
 
+      (and (tx-id? v) (s/commit-generation-attribute? store a))
+      [report (cons [op e a (current-tx report)] entities)]
+
       (and ref? (tx-id? v))
       [(allocate-eid tx-time report v (current-tx report))
        (cons [op e a (current-tx report)] entities)]
+
+      (tx-id? v)
+      (throw
+       (ex-info
+        ":db/current-tx is not a valid value for this attribute."
+        {:type :datalevin/invalid-current-tx-value
+         :datalevin/error :datalevin/invalid-current-tx-value
+         :attribute a
+         :value-type (:db/valueType props)}))
 
       (and ref? (txprep/tempid? v))
       (handle-ref-tempid-value report db tempids entity entities

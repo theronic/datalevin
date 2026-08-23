@@ -1536,7 +1536,8 @@
                  extra-kv-tx       (some-> report
                                            (committed-client-op-response
                                              last-modified-ms))
-                 commit-opts       (cond-> {:last-modified-ms last-modified-ms}
+                 commit-opts       (cond-> {:last-modified-ms last-modified-ms
+                                            :tx-meta (:tx-meta report)}
                                      extra-kv-tx
                                      (assoc :extra-kv-txs [extra-kv-tx]))]
              (s/load-datoms-with-plan! ^Store store tx-data embedding-plan
@@ -1608,7 +1609,8 @@
                  (contains? unique-identity-attrs (first value))))))
 
 (defn- append-blind-value!
-  ^Boolean [^FastList attrs store-opts props attr entity value]
+  ^Boolean [^FastList attrs store-opts props commit-generation-attrs
+            attr entity value]
   (if (or (map? value)
           (datom? value)
           (and (coll? value) (not (bytes? value))))
@@ -1617,11 +1619,16 @@
       (vld/validate-val value entity)
       (.add attrs attr)
       (.add attrs
-            (prepare/correct-value-with-props store-opts props attr value))
+            (if (and (identical? value :db/current-tx)
+                     (contains? commit-generation-attrs attr))
+              value
+              (prepare/correct-value-with-props
+               store-opts props attr value)))
       true)))
 
 (defn- prepare-blind-write-entity
-  [store-schema store-opts tuple-source-attrs unique-identity-attrs entity]
+  [store-schema store-opts commit-generation-attrs
+   tuple-source-attrs unique-identity-attrs entity]
   (let [old-eid   (:db/id entity)
         entity-id (or old-eid (auto-tempid))]
     (when (or (nil? old-eid) (tempid? old-eid))
@@ -1641,12 +1648,15 @@
                               (loop [values (seq raw-value)]
                                 (if-some [value (first values)]
                                   (if (append-blind-value!
-                                        attrs store-opts props attr entity value)
+                                        attrs store-opts props
+                                        commit-generation-attrs
+                                        attr entity value)
                                     (recur (next values))
                                     false)
                                   true))
                               (append-blind-value!
-                                attrs store-opts props attr entity raw-value))]
+                                attrs store-opts props commit-generation-attrs
+                                attr entity raw-value))]
                         (if-not supported-values?
                           (reduced false)
                           true))))))
@@ -1661,6 +1671,8 @@
         store-schema      (schema store)
         store-opts        (opts store)
         store-rschema     (rschema store)
+        commit-generation-attrs
+        (:commit-generation-attributes (s/persisted-write-policy store))
         tuple-source-attrs (:db/attrTuples store-rschema)
         unique-identity-attrs (:db.unique/identity store-rschema)
         auto-entity-time? (boolean (:auto-entity-time? store-opts))
@@ -1670,7 +1682,8 @@
             (if (map? entity)
               (if-let [^PreparedBlindEntity prepared
                        (prepare-blind-write-entity
-                         store-schema store-opts tuple-source-attrs
+                         store-schema store-opts commit-generation-attrs
+                         tuple-source-attrs
                          unique-identity-attrs entity)]
                 (if (or (pos? (alength ^objects (.-attrs prepared)))
                         auto-entity-time?)
@@ -1722,10 +1735,17 @@
                     (if (< j attr-count)
                       (recur (+ j 2)
                              (conj! tx-data
-                                    (datom eid
-                                           (aget attrs j)
-                                           (aget attrs (unchecked-inc j))
-                                           tx-id)))
+                                    (let [attribute (aget attrs j)
+                                          value (aget attrs (unchecked-inc j))]
+                                      (datom
+                                       eid
+                                       attribute
+                                       (if (and (identical? value :db/current-tx)
+                                                (s/commit-generation-attribute?
+                                                 (.-store db) attribute))
+                                         tx-id
+                                         value)
+                                       tx-id))))
                       tx-data))
                   tempids (if (and tempid (not (auto-tempid? tempid)))
                             (assoc! tempids tempid eid)

@@ -22,6 +22,7 @@
    [datalevin.bits :as b]
    [datalevin.pipe :as p]
    [datalevin.read-transaction :as read-tx]
+   [datalevin.write-policy :as write-policy]
    [datalevin.scan :as scan :refer [visit-list*]]
    [datalevin.search :as s]
    [datalevin.secondary-index :as si]
@@ -52,6 +53,7 @@
    [java.util List Comparator Collection HashMap IdentityHashMap UUID]
    [java.util.concurrent TimeUnit ScheduledExecutorService ConcurrentHashMap
     ScheduledFuture]
+   [java.util.concurrent.atomic AtomicBoolean]
    [java.util.concurrent.locks ReentrantReadWriteLock]
    [java.nio ByteBuffer]
    [java.lang AutoCloseable]
@@ -64,7 +66,7 @@
    [datalevin.lmdb DatomKVTxData]))
 
 (declare with-open-opts close-store-resources! release-shared-local-store!
-         assert-no-active-read-snapshots!)
+         assert-no-active-read-snapshots! sync-max-tx-floor! transfer)
 (declare enqueue-secondary-index-work! enqueue-secondary-index-work-if-needed!)
 
 (def ^:private async-secondary-index-option-keys
@@ -281,16 +283,22 @@
                   {} c/implicit-schema)]
     (cond
       (empty? now)
-      (transact-schema lmdb c/implicit-schema)
+      (do
+        (write-policy/assert-schema-admitted!
+         (kv-info lmdb) (keys c/implicit-schema))
+        (transact-schema lmdb c/implicit-schema))
 
       (seq missing)
-      (transact-schema lmdb (update-schema now missing))))
+      (do
+        (write-policy/assert-schema-admitted! (kv-info lmdb) (keys missing))
+        (transact-schema lmdb (update-schema now missing)))))
   (when schema
     (let [old-schema   (load-schema lmdb)
           schema       (prepare-schema-update old-schema schema)
           full-schema  (merge old-schema schema)]
       (vld/validate-schema full-schema)
       (when (schema-update-required? old-schema schema)
+        (write-policy/assert-schema-admitted! (kv-info lmdb) (keys schema))
         (transact-schema lmdb (update-schema old-schema schema)))))
   (load-schema lmdb))
 
@@ -579,6 +587,10 @@
   (mark-state-current! [this last-modified-ms])
   (ensure-current! [this]))
 
+(defprotocol ^:no-doc ICommitState
+  (adopt-committed-datom-state!
+    [this committed-schema committed-max-gt committed-state-sync-ms]))
+
 (defn maybe-ensure-current!
   [this]
   (if (satisfies? IStateSync this)
@@ -656,6 +668,18 @@
             (set! idoc-indices
                   (merge-missing-idoc-indices lmdb idoc-indices schema* opts))
             (mark-state-current! this last-modified-ms)))))
+    this)
+
+  ICommitState
+
+  (adopt-committed-datom-state!
+    [this committed-schema committed-max-gt committed-state-sync-ms]
+    (set! schema committed-schema)
+    (set! rschema (schema->rschema committed-schema))
+    (set! attrs (init-attrs committed-schema))
+    (set! max-aid (init-max-aid committed-schema))
+    (set! max-gt (max ^long max-gt ^long committed-max-gt))
+    (set! state-sync-ms (long committed-state-sync-ms))
     this)
 
   IStore
@@ -745,6 +769,8 @@
           ;; Re-encode stored values before persisting schema change.
           (migrate-attr-values this attr new-vt))
         (when (schema-update-required? schema new-schema)
+          (write-policy/assert-schema-admitted!
+           (kv-info lmdb) (keys new-schema))
           ;; `new-schema` is already the complete effective definition for
           ;; every updated attribute. Persist it directly so an explicitly
           ;; retracted property is not reintroduced by applying the patch a
@@ -805,6 +831,7 @@
   (swap-attr [this attr f x]
     (.swap-attr this attr f x nil))
   (swap-attr [this attr f x y]
+    (write-policy/assert-schema-admitted! (kv-info lmdb) [attr])
     (let [o (or (schema attr)
                 (let [m {:db/aid max-aid}]
                   (set! max-aid (inc ^long max-aid))
@@ -825,6 +852,7 @@
     (locking (lmdb/write-txn lmdb)
       (if-let [props (schema attr)]
         (do
+          (write-policy/assert-schema-admitted! (kv-info lmdb) [attr])
           (vld/validate-attr-deletable
             (.populated?
               this :ave (d/datom c/e0 attr c/v0) (d/datom c/emax attr c/vmax)))
@@ -856,6 +884,8 @@
 
           props
           (do
+            (write-policy/assert-schema-admitted!
+             (kv-info lmdb) [attr new-attr])
             (transact-kv
               lmdb [(lmdb/kv-tx :del c/schema attr :attr)
                     (lmdb/kv-tx :put c/schema new-attr props :attr)
@@ -1379,6 +1409,111 @@
             (u/raise "Fail to val-eq-filter-e-list: " e
                      {:v-idx v-idx :attr attr}))
           out)))))
+
+(defn write-policy-capabilities
+  []
+  write-policy/capabilities)
+
+(defn persisted-write-policy
+  [^Store store]
+  (write-policy/persisted-policy (kv-info (.-lmdb store))))
+
+(defn write-admission-token
+  [^Store store]
+  (write-policy/runtime-token (kv-info (.-lmdb store))))
+
+(defn commit-generation-attribute?
+  [^Store store attribute]
+  (contains? (:commit-generation-attributes (persisted-write-policy store))
+             attribute))
+
+(defn with-write-policy-token
+  [^Store store token f]
+  (let [info (kv-info (.-lmdb store))]
+    (when-not (= (write-policy/runtime-token info) token)
+      (throw
+       (ex-info
+        "The Datalevin administrative write token is invalid."
+        {:type :datalevin/invalid-write-token
+         :datalevin/error :datalevin/invalid-write-token})))
+    (write-policy/with-admin-token token f)))
+
+(defn install-write-policy!
+  [^Store store policy tx-meta]
+  (let [lmdb (.-lmdb store)
+        info (kv-info lmdb)
+        policy (write-policy/normalize policy)
+        physical-schema (schema store)
+        policy-attributes
+        (into #{}
+              (concat (:guarded-attributes policy)
+                      (:frozen-attributes policy)
+                      (:commit-generation-attributes policy)
+                      (map :when-attribute (:stamp-rules policy))
+                      (map :stamp-attribute (:stamp-rules policy))))
+        missing (remove #(contains? physical-schema %) policy-attributes)]
+    (when (seq missing)
+      (throw
+       (ex-info
+        "A write policy names attributes absent from the physical schema."
+        {:type :datalevin/invalid-write-policy
+         :datalevin/error :datalevin/invalid-write-policy
+         :missing-attributes (into (sorted-set) missing)})))
+    (doseq [attribute (:commit-generation-attributes policy)
+            :let [props (physical-schema attribute)]]
+      (when-not (and (= :db.type/long (:db/valueType props))
+                     (not= :db.cardinality/many (:db/cardinality props)))
+        (throw
+         (ex-info
+          "A commit-generation attribute must be cardinality-one long."
+          {:type :datalevin/invalid-write-policy
+           :datalevin/error :datalevin/invalid-write-policy
+           :attribute attribute
+           :schema props}))))
+    (doseq [{:keys [when-attribute stamp-entity]} (:stamp-rules policy)
+            :when (and (vector? stamp-entity)
+                       (= :tuple-position (first stamp-entity)))
+            :let [props (physical-schema when-attribute)
+                  tuple-types (or (:db/tupleTypes props)
+                                  (when-let [tuple-attrs (:db/tupleAttrs props)]
+                                    (mapv #(get-in physical-schema
+                                                  [% :db/valueType])
+                                          tuple-attrs)))]]
+      (when-not (and (= :db.type/tuple (:db/valueType props))
+                     (< (second stamp-entity) (count tuple-types)))
+        (throw
+         (ex-info
+          "A tuple-position stamp selector exceeds its tuple schema."
+          {:type :datalevin/invalid-write-policy
+           :datalevin/error :datalevin/invalid-write-policy
+           :attribute when-attribute
+           :selector stamp-entity
+           :schema props}))))
+    (locking (.-write-txn store)
+      (when (lmdb/writing? lmdb)
+        (throw
+         (ex-info
+          "A write policy cannot be installed inside an open transaction."
+          {:type :datalevin/write-policy-install-in-transaction
+           :datalevin/error :datalevin/write-policy-install-in-transaction})))
+      (let [existing (write-policy/persisted-policy info)]
+        (when (and existing
+                   (not= existing policy)
+                   (not (write-policy/admitted? info tx-meta)))
+          (throw
+           (ex-info
+            "Replacing a persisted Datalevin write policy requires admission."
+            {:type :datalevin/guarded-write-policy-install
+             :datalevin/error :datalevin/guarded-write-policy-install})))
+        (when (not= existing policy)
+          (transact-kv
+           lmdb c/kv-info
+           [[:put write-policy/persisted-policy-key policy]]
+           :keyword :data)
+          (vswap! info assoc write-policy/persisted-policy-key policy))))
+    {:policy policy
+     :write-token (write-policy/runtime-token info)
+     :capabilities write-policy/capabilities}))
 
 (defn- fulltext-op-ref
   [op]
@@ -2666,25 +2801,58 @@
 (defn load-datoms-with-plan!
   ([^Store store datoms embedding-plan]
    (load-datoms-with-plan! store datoms embedding-plan nil))
-  ([^Store store datoms embedding-plan {:keys [extra-kv-txs last-modified-ms]}]
-   (let [[res secondary-index-job-count]
-         (locking (.-write-txn store)
-           (let [plan (prepare-datoms-kv-plan store
-                                              datoms
-                                              embedding-plan
-                                              extra-kv-txs
-                                              last-modified-ms)
-                 res  (commit-datoms-kv-plan!
-                       (.-lmdb store)
-                       (.-search-engines store)
-                       (.-vector-indices store)
-                       (.-embedding-indices store)
-                       (store-idoc-indices store)
-                       plan)]
-             [res (:secondary-index-job-count plan)]))]
+  ([^Store store datoms embedding-plan
+    {:keys [extra-kv-txs last-modified-ms tx-meta]}]
+   (letfn [(commit! [^Store target]
+             (let [plan (prepare-datoms-kv-plan target
+                                                datoms
+                                                embedding-plan
+                                                extra-kv-txs
+                                                last-modified-ms
+                                                tx-meta)
+                   res (commit-datoms-kv-plan!
+                        (.-lmdb target)
+                        (.-search-engines target)
+                        (.-vector-indices target)
+                        (.-embedding-indices target)
+                        (store-idoc-indices target)
+                        plan)]
+               [res (:secondary-index-job-count plan) (:tx-id plan)
+                (max-gt target)]))]
+     (let [[res secondary-index-job-count committed-tx committed-max-gt]
+           (locking (.-write-txn store)
+             (let [lmdb (.-lmdb store)]
+               (if (lmdb/writing? lmdb)
+                 (commit! store)
+                 (let [outcome (volatile! nil)]
+                   ;; The persisted max-tx continuity read must occur after
+                   ;; LMDB grants this environment its cross-process writer
+                   ;; lock. Reading before opening this transaction leaves a
+                   ;; foreign-writer race between the read and the commit.
+                   (lmdb/with-transaction-kv [tx-lmdb lmdb]
+                     (vreset! outcome
+                              (commit! (transfer store tx-lmdb))))
+                   (let [schema* (load-schema lmdb)]
+                     ;; Planning against the transactional Store may discover
+                     ;; schemaless attributes and allocate giant-value ids.
+                     ;; Adopt that committed state only after LMDB commits.
+                     (adopt-committed-datom-state!
+                      store schema* (nth @outcome 3)
+                      (init-state-sync-ms lmdb)))
+                   (sync-max-tx-floor! store (nth @outcome 2))
+                   @outcome))))]
      (when (pos? (long (or secondary-index-job-count 0)))
        (enqueue-secondary-index-work! store))
-     res)))
+       (when-not (and (= committed-tx (max-tx store))
+                      (<= committed-max-gt (max-gt store)))
+         (throw
+          (ex-info
+           "The committed Datalevin generation did not advance the open store."
+           {:type :datalevin/stale-generation
+            :datalevin/error :datalevin/stale-generation
+            :expected committed-tx
+            :actual (max-tx store)})))
+       res))))
 
 (defn- write-attr-info
   [^Store store ^HashMap attr-infos attr value insert?]
@@ -2859,9 +3027,36 @@
   ([^Store store datoms embedding-plan]
    (prepare-datoms-kv-plan store datoms embedding-plan nil nil))
   ([^Store store datoms embedding-plan extra-kv-txs last-modified-ms]
+   (prepare-datoms-kv-plan store datoms embedding-plan extra-kv-txs
+                           last-modified-ms nil))
+  ([^Store store datoms embedding-plan extra-kv-txs last-modified-ms tx-meta]
    ;; Datom operations lead the batch so LMDB can select the primitive-EID
    ;; executor once; generic giant, job, and metadata operations follow.
-   (let [txs    (FastList. (+ 2 (count datoms) (count extra-kv-txs)))
+   (let [lmdb (.-lmdb store)
+         info (kv-info lmdb)
+         ^AtomicBoolean unusable
+         (write-policy/write-unusable-state info)
+         _ (when (and unusable (.get unusable))
+             (throw
+              (ex-info
+               "This Datalevin environment is write-unusable until reopened."
+               {:type :datalevin/write-unusable
+                :datalevin/error :datalevin/write-unusable})))
+         persisted-generation (long (init-max-tx lmdb))
+         in-memory-generation (long (max-tx store))
+         _ (when-not (= persisted-generation in-memory-generation)
+             (when unusable (.set unusable true))
+             (throw
+              (ex-info
+               "Persisted max-tx moved outside this Datalevin writer."
+               {:type :datalevin/max-tx-continuity-violation
+                :datalevin/error :datalevin/max-tx-continuity-violation
+                :persisted-max-tx persisted-generation
+                :in-memory-max-tx in-memory-generation})))
+         committing-generation (inc in-memory-generation)
+         _ (write-policy/enforce-datoms!
+            info datoms committing-generation tx-meta)
+         txs    (FastList. (+ 2 (count datoms) (count extra-kv-txs)))
          ;; fulltext [:a d [e aid v]], [:d d [e aid v]],
          ;; [:g d [e aid gt v]], or [:r d [e aid gt]]
          ft-ds  (FastList.)
@@ -2893,6 +3088,14 @@
      (let [tx-id (long (.advance-max-tx store))
            modified-ms (long (or last-modified-ms
                                  (System/currentTimeMillis)))]
+       (when-not (= committing-generation tx-id)
+         (throw
+          (ex-info
+           "Datalevin allocated a different generation at commit."
+           {:type :datalevin/stale-generation
+            :datalevin/error :datalevin/stale-generation
+            :expected committing-generation
+            :actual tx-id})))
        (when (or (not (.isEmpty ft-jobs))
                  (not (.isEmpty vi-jobs))
                  (not (.isEmpty em-jobs)))
@@ -2910,6 +3113,7 @@
      (doseq [tx extra-kv-txs]
        (.add txs tx))
      {:txs txs
+      :tx-id committing-generation
       :ft-ds ft-ds
       :vi-ds vi-ds
       :em-ds em-ds
