@@ -204,6 +204,7 @@
     (try
       (when-not (closed? conn)
         (when-let [store (.-store ^DB @conn)]
+          (s/assert-no-active-read-snapshots! store)
           (case (release-shared-local-store! store)
             :detached
             (vreset! detached? true)
@@ -708,10 +709,26 @@
     opts))
 
 (defn schema
-  "Return the schema of Datalog DB"
-  [conn]
-  {:pre [(conn? conn)]}
-  (i/schema ^Store (.-store ^DB @conn)))
+  "Return the schema of a Datalog connection or database value.
+
+  Database values include explicit read-snapshot values while they are bound
+  through `with-read-snapshot`. This avoids forcing transaction functions and
+  snapshot consumers to recover a mutable connection merely to inspect the
+  schema used by their database value."
+  [conn-or-db]
+  (cond
+    (conn? conn-or-db)
+    (i/schema ^Store (.-store ^DB @conn-or-db))
+
+    (instance? DB conn-or-db)
+    (db/-schema ^DB conn-or-db)
+
+    :else
+    (throw
+     (ex-info
+      "Schema requires a Datalevin Datalog connection or database value."
+      {:type :datalevin/invalid-schema-source
+       :source-class (some-> conn-or-db class str)}))))
 
 (defn secondary-index-status
   [conn]

@@ -29,6 +29,7 @@
    [datalevin.udf :as udf]
    [datalevin.validate :as vld]
    [datalevin.remote :as r]
+   [datalevin.read-transaction :as read-tx]
    [datalevin.relation :as rel]
    [datalevin.inline :refer [update assoc]]
    [datalevin.interface :as i
@@ -223,12 +224,18 @@
 (defmacro wrap-cache
   [store pattern body]
   `(let [store# ~store
+         required-context#
+         (:datalevin.read-transaction/context (opts store#))
          cache# (.get ^ConcurrentHashMap caches (dir store#))]
-     (if-some [cached# (.get ^LRUCache cache# ~pattern)]
-       cached#
-       (let [res# ~body]
-         (.put ^LRUCache cache# ~pattern res#)
-         res#))))
+     (when required-context#
+       (read-tx/require-bound-context! required-context# :datalog-read))
+     (if (read-tx/cache-bypass-active?)
+       ~body
+       (if-some [cached# (.get ^LRUCache cache# ~pattern)]
+         cached#
+         (let [res# ~body]
+           (.put ^LRUCache cache# ~pattern res#)
+           res#)))))
 
 (defn- sample-init-cache-key
   [a mcount v-ranges pred get-v?]
@@ -571,8 +578,14 @@
   (-searchable? [_] true)
 
   IDB
-  (-schema [_] (schema store))
-  (-rschema [_] (rschema store))
+  (-schema [_]
+    (when-let [context (:datalevin.read-transaction/context (opts store))]
+      (read-tx/require-bound-context! context :schema-read))
+    (schema store))
+  (-rschema [_]
+    (when-let [context (:datalevin.read-transaction/context (opts store))]
+      (read-tx/require-bound-context! context :schema-read))
+    (rschema store))
   (-attrs-by [db property] ((-rschema db) property))
   (-is-attr? [db attr property] (contains? (-attrs-by db property) attr))
   (-clear-tx-cache
@@ -973,6 +986,149 @@
          (TreeSortedSet. ^Comparator d/cmp-datoms-avet)
          (.-pull-patterns old))
     old))
+
+(declare close-read-snapshot!)
+
+(deftype ReadSnapshot [snapshot-db state revision-info materialized]
+  java.lang.AutoCloseable
+  (close [this]
+    (close-read-snapshot! this)
+    nil))
+
+(defn read-snapshot?
+  [candidate]
+  (instance? ReadSnapshot candidate))
+
+(defn- materialized-read-snapshot-state!
+  [^ReadSnapshot snapshot]
+  (let [slot (.-materialized snapshot)]
+    (or @slot
+        (let [candidate
+              (s/materialize-read-snapshot-state (.-state snapshot))]
+          (compare-and-set! slot nil candidate)
+          @slot))))
+
+(defn- read-snapshot-db!
+  [^ReadSnapshot snapshot]
+  (let [slot (.-snapshot-db snapshot)]
+    (or @slot
+        (let [state (materialized-read-snapshot-state! snapshot)
+              candidate
+              (DB. (:store state)
+                   (long (:max-eid state))
+                   (long (:max-tx state))
+                   (TreeSortedSet. ^Comparator d/cmp-datoms-eavt)
+                   (TreeSortedSet. ^Comparator d/cmp-datoms-avet)
+                   (LRUCache. 64))]
+          (compare-and-set! slot nil candidate)
+          @slot))))
+
+(defn read-snapshot-capabilities
+  "Returns snapshot support metadata without acquiring native reader state."
+  [candidate]
+  (cond
+    (not (instance? DB candidate))
+    {:supported? false :reason :not-a-datalog-db}
+
+    (not (instance? Store (.-store ^DB candidate)))
+    {:supported? false :reason :remote-or-non-embedded-store}
+
+    :else
+    (let [^Store store (.-store ^DB candidate)
+          store-options (opts store)
+          lmdb (.-lmdb store)]
+      {:supported? true
+       :backend :embedded
+       :ownership :closeable
+       :thread-affinity :acquiring-platform-thread
+       :cache-mode :bypass
+       :wal? (true? (:wal? store-options))
+       :ha-mode (:ha-mode store-options)
+       :env-flags (set (or (get-env-flags lmdb) #{}))})))
+
+(defn- require-read-snapshot
+  [candidate]
+  (if (read-snapshot? candidate)
+    candidate
+    (throw
+     (ex-info
+      "Value is not a Datalevin read snapshot."
+      {:type :datalevin/invalid-read-snapshot}))))
+
+(defn open-read-snapshot
+  "Opens one explicit, closeable, platform-thread-owned embedded read
+  snapshot over `db`. The snapshot is independent of Datalevin's ambient
+  thread-local reader and global Datalog/query result caches."
+  [db]
+  (when-not (instance? DB db)
+    (throw
+     (ex-info
+      "Explicit read snapshots require a local Datalevin Datalog DB."
+      {:type :datalevin/unsupported-read-snapshot-backend})))
+  (let [^DB db db
+        state (s/acquire-read-snapshot-state (.-store db))
+        materialized (atom nil)
+        snapshot-db (atom nil)
+        revision-info
+        (select-keys state [:max-tx :max-eid])]
+    (ReadSnapshot. snapshot-db state revision-info materialized)))
+
+(defn with-read-snapshot
+  "Runs `f` synchronously with the snapshot's private DB and explicit native
+  reader bound. Nested use of the same snapshot is allowed; another snapshot
+  on the same thread is rejected. No DB or native iterator may escape `f`."
+  [snapshot f]
+  (let [^ReadSnapshot snapshot (require-read-snapshot snapshot)
+        state (.-state snapshot)]
+    (try
+      (read-tx/with-context
+       (:context state)
+       #(f (read-snapshot-db! snapshot)))
+      (catch Throwable error
+        (if-let [classified (read-tx/classify-native-read-error error)]
+          (throw classified)
+          (throw error))))))
+
+(defn read-snapshot-info
+  "Returns immutable metadata captured coherently with the native reader."
+  [snapshot]
+  (let [^ReadSnapshot snapshot (require-read-snapshot snapshot)
+        context (:context (.-state snapshot))]
+    (read-tx/with-context
+     context
+     #(select-keys
+       (materialized-read-snapshot-state! snapshot)
+       [:max-tx :max-eid :schema :rschema :attrs :opts]))))
+
+(defn read-snapshot-revision-info
+  "Returns only the immutable revision bounds captured coherently with the
+  native reader. This avoids exposing or copying physical schema metadata for
+  callers that need snapshot identity only."
+  [snapshot]
+  (let [^ReadSnapshot snapshot (require-read-snapshot snapshot)
+        context (:context (.-state snapshot))]
+    (read-tx/require-open! context :revision-metadata)
+    (.-revision-info snapshot)))
+
+(defn read-snapshot-cache-bypass?
+  "True only while the explicit reader and global-cache bypass are active."
+  [snapshot]
+  (with-read-snapshot
+   snapshot
+   (fn [_]
+     (read-tx/cache-bypass-active?))))
+
+(defn close-read-snapshot!
+  "Closes an explicit read snapshot idempotently on its acquiring thread.
+  Returns true for the call that closes native state and false thereafter."
+  [snapshot]
+  (let [^ReadSnapshot snapshot (require-read-snapshot snapshot)]
+    (boolean (s/release-read-snapshot-state! (.-state snapshot)))))
+
+(defn active-read-snapshot-info
+  "Returns process-local active-reader count and oldest reader age."
+  []
+  (s/active-read-snapshot-info))
 
 (defn ^DB empty-db
   ([] (empty-db nil nil))

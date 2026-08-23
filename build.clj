@@ -23,6 +23,7 @@
 (def java-central-staging-dir (str java-central-dir "/staging"))
 (def embedded-release-dir "target/embedded-release")
 (def embedded-artifact-dir (str embedded-release-dir "/classes"))
+(def embedded-source-dir (str embedded-release-dir "/sources"))
 (def embedded-local-repo (str embedded-release-dir "/m2"))
 (def python-bindings-dir "bindings/python")
 (def javascript-bindings-dir "bindings/javascript")
@@ -31,13 +32,26 @@
 (def runtime-deps-file (str runtime-dir "/deps.edn"))
 (def python-jar-dir (str python-bindings-dir "/src/datalevin/jars"))
 (def javascript-jar-dir (str javascript-bindings-dir "/jars"))
-(def version (or (some->> (slurp "project.clj")
-                          (re-find #"\(def version \"([^\"]+)\"\)")
-                          second)
-                 "dev"))
+(def upstream-version (or (some->> (slurp "project.clj")
+                                   (re-find #"\(def version \"([^\"]+)\"\)")
+                                   second)
+                          "dev"))
+(def version (or (System/getenv "DATALEVIN_RELEASE_VERSION")
+                 upstream-version))
+(def fork-build?
+  (boolean (System/getenv "DATALEVIN_EACL_FORK")))
+(def fork-upstream-commit "02c765c4fb107bce70fd0254d376c254ca6ede57")
+(def fork-revision
+  (or (System/getenv "DATALEVIN_FORK_REVISION") "UNCOMMITTED"))
+(def fork-source-url
+  (or (System/getenv "DATALEVIN_FORK_SOURCE_URL") "UNPUBLISHED"))
+(def native-version "0.18.8")
 (def java-lib 'org.datalevin/datalevin-java)
 (def java-server-lib 'org.datalevin/datalevin-java-server)
-(def embedded-lib 'org.datalevin/datalevin-embedded)
+(def embedded-lib
+  (if fork-build?
+    'dev.eacl/datalevin-embedded-eacl
+    'org.datalevin/datalevin-embedded))
 (def clojure-runtime-lib 'org.clojure/clojure)
 (def javacpp-lib 'org.bytedeco/javacpp)
 (def java-jar-file (format "target/datalevin-java-%s.jar" version))
@@ -52,6 +66,8 @@
   (format "target/datalevin-java-server-%s-javadoc.jar" version))
 (def embedded-jar-file (format "target/datalevin-embedded-%s.jar" version))
 (def embedded-pom-file (format "target/datalevin-embedded-%s.pom" version))
+(def embedded-source-jar-file
+  (format "target/datalevin-embedded-%s-sources.jar" version))
 (def runtime-jar-file (format "target/datalevin-runtime-%s.jar" version))
 (def java-central-bundle-file
   (format "%s/datalevin-java-%s-central-bundle.zip" java-central-dir version))
@@ -130,10 +146,18 @@
 (def binding-jar-dirs
   [python-jar-dir
    javascript-jar-dir])
-(def scm {:connection          "scm:git:https://github.com/datalevin/datalevin.git"
-          :developerConnection "scm:git:git@github.com:datalevin/datalevin.git"
-          :tag                 (str "v" version)
-          :url                 "https://github.com/datalevin/datalevin"})
+(def scm
+  (if fork-build?
+    {:connection (str "scm:git:" fork-source-url ".git")
+     :developerConnection
+     (or (System/getenv "DATALEVIN_FORK_DEVELOPER_CONNECTION")
+         "UNPUBLISHED")
+     :tag fork-revision
+     :url fork-source-url}
+    {:connection "scm:git:https://github.com/datalevin/datalevin.git"
+     :developerConnection "scm:git:git@github.com:datalevin/datalevin.git"
+     :tag (str "v" version)
+     :url "https://github.com/datalevin/datalevin"}))
 (def bundled-native-libs
   '#{org.clojars.huahaiy/dtlvnative-macosx-arm64
      org.clojars.huahaiy/dtlvnative-linux-arm64
@@ -317,6 +341,7 @@
                 java-server-javadoc-jar-file
                 embedded-jar-file
                 embedded-pom-file
+                embedded-source-jar-file
                 runtime-dir
                 runtime-jar-file
                 java-central-bundle-file]]
@@ -416,7 +441,20 @@
        "  <packaging>jar</packaging>\n"
        "  <name>" title "</name>\n"
        "  <description>" description "</description>\n"
-       "  <url>https://github.com/datalevin/datalevin</url>\n"
+       "  <url>" (:url scm) "</url>\n"
+       (when fork-build?
+         (str "  <properties>\n"
+              "    <datalevin.upstream.version>" upstream-version
+              "</datalevin.upstream.version>\n"
+              "    <datalevin.upstream.commit>" fork-upstream-commit
+              "</datalevin.upstream.commit>\n"
+              "    <datalevin.fork.revision>" fork-revision
+              "</datalevin.fork.revision>\n"
+              "    <datalevin.native.version>" native-version
+              "</datalevin.native.version>\n"
+              "    <datalevin.build.java>" (System/getProperty "java.version")
+              "</datalevin.build.java>\n"
+              "  </properties>\n"))
        "  <licenses>\n"
        "    <license>\n"
        "      <name>EPL-2.0</name>\n"
@@ -518,6 +556,8 @@
   (b/delete {:path target-dir})
   (b/copy-dir {:src-dirs   (existing-dirs ["src" "resources" class-dir])
                :target-dir target-dir})
+  (b/copy-file {:src "LICENSE"
+                :target (str target-dir "/META-INF/LICENSE")})
   ;; Keep release jars free of embedded Java sources.
   (b/delete {:path (str target-dir "/java")})
   ;; Embedded consumers do not need the CLI, pod entrypoint, or HA/server runtime.
@@ -735,26 +775,98 @@
   (prep-embedded-artifact!)
   (b/jar {:class-dir embedded-artifact-dir
           :jar-file  embedded-jar-file
-          :manifest  {"Implementation-Title"   "Datalevin Embedded"
-                      "Implementation-Version" version}})
+          :manifest
+          (cond-> {"Implementation-Title" "Datalevin Embedded"
+                   "Implementation-Version" version}
+            fork-build?
+            (assoc "Datalevin-Upstream-Version" upstream-version
+                   "Datalevin-Upstream-Commit" fork-upstream-commit
+                   "Datalevin-Fork-Revision" fork-revision
+                   "Datalevin-Native-Version" native-version
+                   "Build-Jdk" (System/getProperty "java.version")))})
   (println "Generated Datalevin embedded jar at" embedded-jar-file)
   {:jar-file embedded-jar-file
    :pom-file embedded-pom-file})
 
+(defn embedded-source-jar
+  [_]
+  (b/delete {:path embedded-source-dir})
+  (b/copy-dir {:src-dirs (existing-dirs ["src" "resources"])
+               :target-dir embedded-source-dir})
+  (b/delete {:path (str embedded-source-dir "/java")})
+  (delete-under-root! embedded-source-dir release-runtime-source-excludes)
+  (b/copy-file {:src "LICENSE"
+                :target (str embedded-source-dir "/META-INF/LICENSE")})
+  (b/jar {:class-dir embedded-source-dir
+          :jar-file embedded-source-jar-file})
+  {:source-jar embedded-source-jar-file})
+
+(defn assert-eacl-fork-release-ready!
+  "Rejects a maintained-fork release unless its coordinate, immutable clean
+  source revision, and public SCM identity are explicit."
+  []
+  (when-not fork-build?
+    (throw
+     (ex-info "The EACL fork release requires DATALEVIN_EACL_FORK=1."
+              {:type :datalevin.release/not-fork-build})))
+  (when-not (re-matches #"1\.0\.2-eacl\.[1-9][0-9]*" version)
+    (throw
+     (ex-info "The EACL fork version does not match the approved scheme."
+              {:type :datalevin.release/invalid-fork-version
+               :version version})))
+  (when-not (and (re-matches #"https://[^ ]+" fork-source-url)
+                 (not= "UNPUBLISHED" (:developerConnection scm)))
+    (throw
+     (ex-info "The EACL fork requires a public HTTPS SCM and developer connection."
+              {:type :datalevin.release/unpublished-source
+               :source-url fork-source-url})))
+  (when-not (re-matches #"[0-9a-f]{40}" fork-revision)
+    (throw
+     (ex-info "The EACL fork requires an immutable 40-hex source revision."
+              {:type :datalevin.release/invalid-fork-revision
+               :revision fork-revision})))
+  (let [head (str/trim (:out (run-process! ["git" "rev-parse" "HEAD"])))
+        status (:out (run-process! ["git" "status" "--porcelain"
+                                    "--untracked-files=all"]))]
+    (when-not (= fork-revision head)
+      (throw
+       (ex-info "The declared fork revision is not the checked-out HEAD."
+                {:type :datalevin.release/revision-mismatch
+                 :declared fork-revision
+                 :head head})))
+    (when-not (str/blank? status)
+      (throw
+       (ex-info "The maintained fork release must be built from a clean worktree."
+                {:type :datalevin.release/dirty-worktree}))))
+  true)
+
+(defn eacl-fork-embedded-jar
+  [_]
+  (assert-eacl-fork-release-ready!)
+  (merge (embedded-jar nil)
+         (embedded-source-jar nil)))
+
 (defn install-embedded [_]
   (embedded-jar nil)
-  (install-artifact! embedded-local-repo
-                     embedded-lib
-                     embedded-jar-file
-                     (format "datalevin-embedded-%s.jar" version))
-  (install-artifact! embedded-local-repo
-                     embedded-lib
-                     embedded-pom-file
-                     (format "datalevin-embedded-%s.pom" version))
+  (embedded-source-jar nil)
+  (let [artifact-id (name embedded-lib)]
+    (install-artifact! embedded-local-repo
+                       embedded-lib
+                       embedded-jar-file
+                       (format "%s-%s.jar" artifact-id version))
+    (install-artifact! embedded-local-repo
+                       embedded-lib
+                       embedded-pom-file
+                       (format "%s-%s.pom" artifact-id version))
+    (install-artifact! embedded-local-repo
+                       embedded-lib
+                       embedded-source-jar-file
+                       (format "%s-%s-sources.jar" artifact-id version)))
   (write-metadata! embedded-local-repo embedded-lib)
   (println "Installed embedded release artifacts in" embedded-local-repo)
   {:jar-file   embedded-jar-file
    :pom-file   embedded-pom-file
+   :source-jar embedded-source-jar-file
    :local-repo embedded-local-repo})
 
 (defn- prep-runtime-artifact! []

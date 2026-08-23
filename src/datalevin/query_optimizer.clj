@@ -25,6 +25,7 @@
    [datalevin.query.optimizer.range :as qor]
    [datalevin.query.plan :as qplan]
    [datalevin.query.resolve :as qresolve]
+   [datalevin.read-transaction :as read-tx]
    [datalevin.query-util :as qu]
    [datalevin.relation :as r]
    [datalevin.util :as u :refer [cond+ raise conjv concatv map+]])
@@ -2851,7 +2852,9 @@
           (let [^DB db        (sources src)
                 required-vars (required-plan-vars context src)
                 k             [(.-store db) nodes required-vars]]
-            (if-let [cached (.get ^LRUCache (plan-cache) k)]
+            (if-let [cached
+                     (when-not (read-tx/cache-bypass-active?)
+                       (.get ^LRUCache (plan-cache) k))]
               (assoc-in c [:plan src] cached)
               (let [nodes (update-nodes db nodes)
                     plans (if (< 1 (count nodes))
@@ -2859,7 +2862,9 @@
                             [[(base-plan db nodes (ffirst nodes) true)]])]
                 (if (some #(some nil? %) plans)
                   (reduced (assoc c :result-set #{}))
-                  (do (.put ^LRUCache (plan-cache) k (strip-result plans))
+                  (do (when-not (read-tx/cache-bypass-active?)
+                        (.put ^LRUCache
+                              (plan-cache) k (strip-result plans)))
                       (assoc-in c [:plan src] plans)))))))
         context graph))
     context))

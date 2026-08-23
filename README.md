@@ -146,6 +146,10 @@ documentation](https://cljdoc.org/d/datalevin/datalevin) and
 [JavaDoc](https://javadoc.io/doc/org.datalevin/datalevin-java/latest/datalevin/package-summary.html)
 for API details.
 
+Embedded Clojure callers that require one stable native read transaction across
+multiple Datalog operations should use the
+[explicit read-snapshot API](doc/read-snapshots.md).
+
 ## :tada: Quick Examples
 
 Datalevin is aimed to be a versatile database.

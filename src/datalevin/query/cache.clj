@@ -16,7 +16,8 @@
    [datalevin.lmdb :as l]
    [datalevin.parser :as dp]
    [datalevin.query.execute :as qexec]
-   [datalevin.query.resolve :as qresolve])
+   [datalevin.query.resolve :as qresolve]
+   [datalevin.read-transaction :as read-tx])
   (:import
    [datalevin.db DB]
    [datalevin.parser Constant Function Pattern]
@@ -32,7 +33,8 @@
   (qexec/q* parsed-q inputs))
 
 (defn- cache-enabled? []
-  (boolean *cache?*))
+  (and (boolean *cache?*)
+       (not (read-tx/cache-bypass-active?))))
 
 (defn parsed-q
   [q]

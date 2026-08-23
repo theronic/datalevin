@@ -1013,6 +1013,64 @@ Only usable for debug output.
        :doc      "Returns the underlying Datalog database object from a connection. Note that Datalevin does not have \"db as a value\" feature, the returned object is NOT a database value, but a reference to the database object. "}
   db conn/db)
 
+(def ^{:arglists '([conn-or-db])
+       :doc      "Open a closeable, explicit embedded LMDB read snapshot.
+
+  The snapshot owns one fresh native read-only transaction, is confined to
+  its acquiring platform thread, bypasses global Datalog/query result caches,
+  and remains stable across concurrent commits. Close it with
+  [[close-read-snapshot!]] or `with-open`."}
+  open-read-snapshot
+  (fn [conn-or-db]
+    (db/open-read-snapshot
+     (if (db/db? conn-or-db) conn-or-db (conn/db conn-or-db)))))
+
+(def ^{:arglists '([candidate])
+       :doc      "Return true when `candidate` is an explicit Datalevin read
+  snapshot handle."}
+  read-snapshot? db/read-snapshot?)
+
+(def ^{:arglists '([conn-or-db])
+       :doc      "Return whether a connection or DB supports the public
+  embedded explicit read-snapshot API, without acquiring native state."}
+  read-snapshot-capabilities
+  (fn [conn-or-db]
+    (db/read-snapshot-capabilities
+     (if (db/db? conn-or-db) conn-or-db (conn/db conn-or-db)))))
+
+(def ^{:arglists '([snapshot f])
+       :doc      "Run `f` synchronously with the private DB of an open explicit
+  read snapshot. All Datalog access to the snapshot must occur in this scope;
+  use after close, cross-thread use, and conflicting nested snapshots fail
+  before native access."}
+  with-read-snapshot db/with-read-snapshot)
+
+(def ^{:arglists '([snapshot])
+       :doc      "Return the immutable max transaction, max entity, schema,
+  reverse schema, attribute mapping, and decoding options captured by a read
+  snapshot."}
+  read-snapshot-info db/read-snapshot-info)
+
+(def ^{:arglists '([snapshot])
+       :doc      "Return only the immutable max transaction and max entity
+  captured by a read snapshot, without exposing physical schema metadata."}
+  read-snapshot-revision-info db/read-snapshot-revision-info)
+
+(def ^{:arglists '([snapshot])
+       :doc      "Return true while the snapshot's explicit reader and global
+  Datalog/query cache bypass are active."}
+  read-snapshot-cache-bypass? db/read-snapshot-cache-bypass?)
+
+(def ^{:arglists '([snapshot])
+       :doc      "Close an explicit read snapshot idempotently on its owner
+  thread. Returns true once and false on later calls."}
+  close-read-snapshot! db/close-read-snapshot!)
+
+(def ^{:arglists '([])
+       :doc      "Return process-local active explicit reader count and oldest
+  reader age in milliseconds."}
+  active-read-snapshot-info db/active-read-snapshot-info)
+
 (def ^{:arglists '([conn])
        :doc      "Return the option map of the Datalog DB"}
   opts conn/opts)

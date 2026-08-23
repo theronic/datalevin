@@ -21,6 +21,7 @@
    [datalevin.migrate :as m]
    [datalevin.validate :as vld]
    [datalevin.scan :as scan]
+   [datalevin.read-transaction :as read-tx]
    [datalevin.interface :as i
     :refer [IList ILMDB IAdmin open-dbi close-kv env-dir close-vecs
             transact-kv get-range stat key-compressor
@@ -1183,15 +1184,47 @@
           (close-rtx-quiet! old))))
     rtx))
 
+(defn- explicit-reader-rtx
+  [this ^Env env]
+  (let [max-val-size* (long (max-val-size this))]
+    (Rtx. this
+          (Txn/createReadOnly env)
+          (volatile! 1)
+          (new-bufval c/+max-key-size+)
+          (new-bufval 0)
+          (new-bufval c/+max-key-size+)
+          (new-bufval c/+max-key-size+)
+          (new-bufval c/+max-key-size+)
+          (new-bufval c/+max-key-size+)
+          (bf/allocate-buffer c/+max-key-size+)
+          (bf/allocate-buffer max-val-size*)
+          (volatile! false)
+          (AtomicBoolean.)
+          true)))
+
 (defn- read-transaction-acquisition-error
   [dir ^Exception e]
   (ex-info
-    (str "Failed to acquire LMDB read transaction: " (ex-message e))
-    {:type      :lmdb/read-transaction
-     :operation :acquire
-     :dir       dir
-     :cause     (ex-message e)}
-    e))
+   (str "Failed to acquire LMDB read transaction: " (ex-message e))
+   {:type :lmdb/read-transaction
+    :operation :acquire
+    :dir dir
+    :cause (ex-message e)}
+   e))
+
+(defn- explicit-read-snapshot-acquisition-error
+  [^Exception e]
+  (let [native-message (or (ex-message e) "native reader failure")
+        reason (or (read-tx/native-failure-reason e)
+                   (if (re-find #"MDB_READERS_FULL" native-message)
+                     :reader-slots-exhausted
+                     :native-reader-failure))]
+    (ex-info
+     "Failed to acquire an explicit Datalevin read snapshot."
+     {:type :datalevin/read-snapshot-acquisition-failed
+      :operation :acquire
+      :reason reason}
+     e)))
 
 (defn- sync-key* [dir] (->> dir hash (str "lmdb-sync-") keyword))
 
@@ -1565,7 +1598,8 @@
   (get-rtx [this]
     (when-not (.closed-kv? this)
       (try
-        (or (reusable-reader-rtx this tl-reader reader-registry)
+        (or (read-tx/bound-rtx this)
+            (reusable-reader-rtx this tl-reader reader-registry)
             (do
               (sweep-dead-reader-rtxs! reader-registry)
               (fresh-reader-rtx this env tl-reader reader-registry)))
@@ -1574,11 +1608,17 @@
 
   (return-rtx [this rtx]
     (when-not (.closed-kv? this)
-      (if (.isVirtual (Thread/currentThread))
+      (cond
+        (read-tx/bound-rtx? this rtx)
+        nil
+
+        (.isVirtual (Thread/currentThread))
         (try
           (close-rtx-quiet! rtx)
           (finally
             (.remove tl-reader)))
+
+        :else
         (.reset ^Rtx rtx))))
 
   (stat [_]
@@ -2037,6 +2077,36 @@
         (.remove reader-registry thread rtx)
         (close-rtx-quiet! rtx)
         (.remove tl-reader))))
+  nil)
+
+(defn acquire-read-snapshot-tx
+  "Acquires a fresh read-only transaction that is never installed in the
+  ambient thread-local reader cache. Public callers use the higher-level
+  `datalevin.core/open-read-snapshot`; this function is the native boundary."
+  [lmdb]
+  (when (.isVirtual (Thread/currentThread))
+    (throw
+     (ex-info
+      "Explicit Datalevin read snapshots require a platform thread."
+      {:type :datalevin/unsupported-read-snapshot-runtime
+       :runtime :virtual-thread})))
+  (when-not (instance? CppLMDB lmdb)
+    (throw
+     (ex-info
+      "Explicit read snapshots require the local embedded LMDB backend."
+      {:type :datalevin/unsupported-read-snapshot-backend})))
+  (let [^CppLMDB lmdb lmdb]
+    (try
+      (i/check-ready lmdb)
+      (explicit-reader-rtx lmdb (.-env lmdb))
+      (catch Exception error
+        (throw
+         (explicit-read-snapshot-acquisition-error error))))))
+
+(defn release-read-snapshot-tx
+  "Closes a transaction returned by `acquire-read-snapshot-tx`."
+  [rtx]
+  (close-rtx-quiet! rtx)
   nil)
 
 (defn- key-range-list-count-fast

@@ -17,6 +17,7 @@
    [datalevin.constants :as c]
    [datalevin.interface :as i]
    [datalevin.lmdb :as l]
+   [datalevin.read-transaction :as read-tx]
    [datalevin.txlog :as txlog]
    [datalevin.util :as u :refer [raise]])
   (:import
@@ -3898,7 +3899,17 @@
                    [[:del [:dbis dbi-name]]]
                    [:keyword :string])))
 
-(deftype KVLMDB [db]
+(defn- reject-snapshot-write!
+  [read-context operation]
+  (when read-context
+    (read-tx/require-bound-context! read-context operation)
+    (throw
+     (ex-info
+      "Explicit read-snapshot storage is read-only."
+      {:type :datalevin/read-snapshot-read-only
+       :operation operation}))))
+
+(deftype KVLMDB [db read-context]
   l/IWriting
   (writing? [_] (l/writing? db))
   (write-txn [_] (l/write-txn db))
@@ -3906,8 +3917,12 @@
   (reset-write [_] (wrap-lmdb (l/reset-write db)))
 
   i/IList
-  (del-list-items [this a0 a1 a2] (i/del-list-items db a0 a1 a2))
-  (del-list-items [this a0 a1 a2 a3 a4] (i/del-list-items db a0 a1 a2 a3 a4))
+  (del-list-items [this a0 a1 a2]
+    (reject-snapshot-write! read-context :del-list-items)
+    (i/del-list-items db a0 a1 a2))
+  (del-list-items [this a0 a1 a2 a3 a4]
+    (reject-snapshot-write! read-context :del-list-items)
+    (i/del-list-items db a0 a1 a2 a3 a4))
   (get-list [this a0 a1 a2 a3] (i/get-list db a0 a1 a2 a3))
   (in-list? [this a0 a1 a2 a3 a4] (i/in-list? db a0 a1 a2 a3 a4))
   (list-count [this a0 a1 a2] (i/list-count db a0 a1 a2))
@@ -3925,7 +3940,9 @@
   (list-range-some [this a0 a1 a2 a3 a4 a5] (i/list-range-some db a0 a1 a2 a3 a4 a5))
   (list-range-some [this a0 a1 a2 a3 a4 a5 a6] (i/list-range-some db a0 a1 a2 a3 a4 a5 a6))
   (near-list [this a0 a1 a2 a3 a4] (i/near-list db a0 a1 a2 a3 a4))
-  (put-list-items [this a0 a1 a2 a3 a4] (i/put-list-items db a0 a1 a2 a3 a4))
+  (put-list-items [this a0 a1 a2 a3 a4]
+    (reject-snapshot-write! read-context :put-list-items)
+    (i/put-list-items db a0 a1 a2 a3 a4))
   (visit-list [this a0 a1 a2 a3] (i/visit-list db a0 a1 a2 a3))
   (visit-list [this a0 a1 a2 a3 a4] (i/visit-list db a0 a1 a2 a3 a4))
   (visit-list [this a0 a1 a2 a3 a4 a5] (i/visit-list db a0 a1 a2 a3 a4 a5))
@@ -3937,8 +3954,12 @@
   (visit-list-sample [this a0 a1 a2 a3 a4 a5 a6] (i/visit-list-sample db a0 a1 a2 a3 a4 a5 a6))
 
   i/IAdmin
-  (re-index [this a0] (i/re-index db a0))
-  (re-index [this a0 a1] (i/re-index db a0 a1))
+  (re-index [this a0]
+    (reject-snapshot-write! read-context :re-index)
+    (i/re-index db a0))
+  (re-index [this a0 a1]
+    (reject-snapshot-write! read-context :re-index)
+    (i/re-index db a0 a1))
 
   i/ITxLog
   (txlog-watermarks [_]
@@ -4079,24 +4100,30 @@
 
   i/ILMDB
   (open-transact-kv [_]
+    (reject-snapshot-write! read-context :open-transact-kv)
     (when (txlog-write-path-enabled? db)
       (ensure-txlog-ready! db))
     (let [wdb (i/open-transact-kv db)]
       (when (txlog-write-path-enabled? db)
         (txlog-reset-pending! (i/kv-info db)))
-      (->KVLMDB wdb)))
+      (->KVLMDB wdb nil)))
   (abort-transact-kv [_]
+    (reject-snapshot-write! read-context :abort-transact-kv)
     (when (txlog-config-enabled? db)
       (txlog-reset-pending! (i/kv-info db)))
     (i/abort-transact-kv db))
   (check-ready [this] (i/check-ready db))
-  (clear-dbi [this a0] (i/clear-dbi db a0))
+  (clear-dbi [this a0]
+    (reject-snapshot-write! read-context :clear-dbi)
+    (i/clear-dbi db a0))
   (close-kv [_]
+    (reject-snapshot-write! read-context :close-kv)
     (try
       (i/close-kv db)
       (finally
         (close-txlog-state! db))))
   (close-transact-kv [_]
+    (reject-snapshot-write! read-context :close-transact-kv)
     (with-write-txn-lock-before-runtime-txlog-state
       db
       (fn []
@@ -4110,6 +4137,7 @@
   (copy [this a0 a1] (txlog-copy-with-backup-pin! this db a0 a1))
   (dbi-opts [this a0] (i/dbi-opts db a0))
   (drop-dbi [this a0]
+    (reject-snapshot-write! read-context :drop-dbi)
     (let [before (try
                    (i/dbi-opts db a0)
                    (catch Exception _ nil))
@@ -4141,7 +4169,10 @@
   (get-range [this a0 a1 a2 a3 a4] (i/get-range db a0 a1 a2 a3 a4))
   (get-rank [this a0 a1] (i/get-rank db a0 a1))
   (get-rank [this a0 a1 a2] (i/get-rank db a0 a1 a2))
-  (get-rtx [this] (i/get-rtx db))
+  (get-rtx [this]
+    (when read-context
+      (read-tx/require-bound-context! read-context :native-read))
+    (i/get-rtx db))
   (get-some [this a0 a1 a2] (i/get-some db a0 a1 a2))
   (get-some [this a0 a1 a2 a3] (i/get-some db a0 a1 a2 a3))
   (get-some [this a0 a1 a2 a3 a4] (i/get-some db a0 a1 a2 a3 a4))
@@ -4203,7 +4234,10 @@
   (range-some [this a0 a1 a2 a3] (i/range-some db a0 a1 a2 a3))
   (range-some [this a0 a1 a2 a3 a4] (i/range-some db a0 a1 a2 a3 a4))
   (range-some [this a0 a1 a2 a3 a4 a5] (i/range-some db a0 a1 a2 a3 a4 a5))
-  (return-rtx [this a0] (i/return-rtx db a0))
+  (return-rtx [this a0]
+    (when read-context
+      (read-tx/require-bound-context! read-context :native-read-release))
+    (i/return-rtx db a0))
   (sample-kv [this a0 a1] (i/sample-kv db a0 a1))
   (sample-kv [this a0 a1 a2] (i/sample-kv db a0 a1 a2))
   (sample-kv [this a0 a1 a2 a3] (i/sample-kv db a0 a1 a2 a3))
@@ -4220,6 +4254,7 @@
   (transact-kv [this a0 a1] (.transact-kv this a0 a1 :data :data))
   (transact-kv [this a0 a1 a2] (.transact-kv this a0 a1 a2 :data))
   (transact-kv [_ a0 a1 a2 a3]
+    (reject-snapshot-write! read-context :transact-kv)
     (with-write-txn-lock-before-runtime-txlog-state
       db
       (fn []
@@ -4245,6 +4280,12 @@
     (.-db ^KVLMDB db)
     db))
 
+(defn with-read-context
+  "Returns an LMDB wrapper that requires `context` for every native reader
+  acquisition and rejects writes. The wrapper never owns the underlying env."
+  [db context]
+  (->KVLMDB (raw-lmdb db) context))
+
 (defn wrap-lmdb
   [db]
   (if (instance? KVLMDB db)
@@ -4254,7 +4295,7 @@
                   (i/env-opts db)))]
       (try
         (ensure-txlog-ready! db)
-        (->KVLMDB db)
+        (->KVLMDB db nil)
         (catch Exception e
           (if fallback-attempted?
             (do

@@ -21,6 +21,7 @@
    [datalevin.relation :as r]
    [datalevin.bits :as b]
    [datalevin.pipe :as p]
+   [datalevin.read-transaction :as read-tx]
    [datalevin.scan :as scan :refer [visit-list*]]
    [datalevin.search :as s]
    [datalevin.secondary-index :as si]
@@ -62,7 +63,8 @@
    [datalevin.bits Retrieved Indexable]
    [datalevin.lmdb DatomKVTxData]))
 
-(declare with-open-opts close-store-resources! release-shared-local-store!)
+(declare with-open-opts close-store-resources! release-shared-local-store!
+         assert-no-active-read-snapshots!)
 (declare enqueue-secondary-index-work! enqueue-secondary-index-work-if-needed!)
 
 (def ^:private async-secondary-index-option-keys
@@ -70,6 +72,16 @@
     :async-secondary-index-worker-lease-ms
     :async-secondary-index-retry-base-ms
     :async-secondary-index-retry-max-ms})
+
+(def ^:dynamic *read-snapshot-fault-injector*
+  "Internal deterministic certification hook. A bound function receives a
+  snapshot lifecycle phase keyword and may throw."
+  nil)
+
+(defn- inject-read-snapshot-fault!
+  [phase]
+  (when *read-snapshot-fault-injector*
+    (*read-snapshot-fault-injector* phase)))
 
 (defn- apply-option-mutations
   [opts kvs]
@@ -683,6 +695,7 @@
 
   (close [this]
     (when-not local-closed?
+      (assert-no-active-read-snapshots! this)
       (case (release-shared-local-store! this)
         :detached
         (set! local-closed? true)
@@ -3922,6 +3935,142 @@
   LMDB instance"
   [^Store old lmdb]
   (transfer-with-schema old lmdb (schema old)))
+
+(defn acquire-read-snapshot-state
+  "Acquires a fresh explicit native reader and captures revision bounds only.
+
+  Physical schema and decoding state stay lazy until the snapshot performs a
+  Datalog read or `read-snapshot-info` is requested. Both paths materialize
+  through the already-owned immutable reader, so acquisition does not read,
+  copy, or compare the physical attribute schema."
+  [store]
+  (when-not (instance? Store store)
+    (throw
+     (ex-info
+      "Explicit read snapshots require a local embedded Datalevin store."
+      {:type :datalevin/unsupported-read-snapshot-backend})))
+  (when (.isVirtual (Thread/currentThread))
+    (throw
+     (ex-info
+      "Explicit Datalevin read snapshots require a platform thread."
+      {:type :datalevin/unsupported-read-snapshot-runtime
+       :runtime :virtual-thread})))
+  (read-tx/require-not-interrupted! :acquisition)
+  (inject-read-snapshot-fault! :before-native-acquisition)
+  (let [^Store old store
+        lmdb (.-lmdb old)
+        raw-lmdb (kv/raw-lmdb lmdb)
+        rtx (cpp/acquire-read-snapshot-tx raw-lmdb)
+        context (read-tx/new-context raw-lmdb rtx)]
+    (try
+      (inject-read-snapshot-fault! :after-native-acquisition)
+      (read-tx/with-context
+       context
+       (fn []
+         {:context context
+          :source-store old
+          :max-tx (long (init-max-tx lmdb))
+          :max-eid (long (.init-max-eid old))}))
+      (catch Throwable error
+        (when (read-tx/begin-close! context)
+          (try
+            (cpp/release-read-snapshot-tx rtx)
+            (read-tx/finish-close! context)
+            (catch Throwable release-error
+              (read-tx/abort-close! context)
+              (throw
+               (ex-info
+                "Read snapshot acquisition failed and native cleanup also failed."
+                {:type :datalevin/read-snapshot-acquisition-cleanup-failed
+                 :acquisition-error (ex-data error)}
+                release-error)))))
+        (throw error)))))
+
+(defn materialize-read-snapshot-state
+  "Builds the private read-only Store for an acquired snapshot on demand.
+
+  The caller must bind the state's explicit read context. A delay owned by the
+  public snapshot handle ensures this physical schema work happens at most
+  once and always against the acquisition's native revision."
+  [{:keys [context source-store max-tx max-eid] :as state}]
+  (read-tx/require-bound-context! context :snapshot-materialization)
+  (inject-read-snapshot-fault! :before-physical-materialization)
+  (let [^Store old source-store
+        lmdb (.-lmdb old)
+        schema* (load-schema lmdb)
+        rschema* (schema->rschema schema*)
+        attrs* (init-attrs schema*)
+        persisted-opts (or (load-opts lmdb) {})
+        opts* (store-visible-opts
+               (merge (opts old) persisted-opts))
+        snapshot-lmdb (kv/with-read-context lmdb context)
+        snapshot-opts
+        (assoc opts*
+               :datalevin.read-transaction/context context)
+        snapshot-store
+        (->Store snapshot-lmdb
+                 (.-search-engines old)
+                 (.-vector-indices old)
+                 (.-embedding-indices old)
+                 (store-idoc-indices old)
+                 (.-embedding-providers old)
+                 (.-counts old)
+                 snapshot-opts
+                 schema*
+                 rschema*
+                 attrs*
+                 (init-max-aid schema*)
+                 (init-max-gt lmdb)
+                 (long max-tx)
+                 (init-state-sync-ms lmdb)
+                 (.-scheduled-sampling old)
+                 (.-write-txn old)
+                 (.-sampling-lock old)
+                 false
+                 (.-shared-dir-key old))]
+    (assoc state
+           :store snapshot-store
+           :max-eid (long max-eid)
+           :schema schema*
+           :rschema rschema*
+           :attrs attrs*
+           :opts opts*)))
+
+(defn assert-no-active-read-snapshots!
+  "Prevents an embedded Store/environment from closing under explicit native
+  readers. Callers may close the readers and retry the close operation."
+  [store]
+  (when (instance? Store store)
+    (let [raw-lmdb (kv/raw-lmdb (.-lmdb ^Store store))
+          active (read-tx/active-reader-count raw-lmdb)]
+      (when (pos? active)
+        (throw
+         (ex-info
+          "Cannot close a Datalevin store while explicit read snapshots are active."
+          {:type :datalevin/active-read-snapshots
+           :operation :close
+           :active active})))))
+  nil)
+
+(defn release-read-snapshot-state!
+  [{:keys [context]}]
+  (when (read-tx/begin-close! context)
+    (try
+      (inject-read-snapshot-fault! :before-native-release)
+      (cpp/release-read-snapshot-tx (:rtx context))
+      (read-tx/finish-close! context)
+      true
+      (catch Throwable error
+        (read-tx/abort-close! context)
+        (throw
+         (ex-info
+          "Failed to close an explicit Datalevin read snapshot."
+          {:type :datalevin/read-snapshot-release-failed}
+          error))))))
+
+(defn active-read-snapshot-info
+  []
+  (read-tx/active-reader-info))
 
 (defn- transfer-current
   "Transfer a Store while taking its schema from the LMDB transaction. The
