@@ -2814,6 +2814,60 @@
                     (ensure-embedding-vector! domain dimensions vec-data)))))
         plan))))
 
+(defn with-datom-write-transaction
+  "Call `f` with a Store that commits datoms through one LMDB write
+  transaction, and return its result.
+
+  A Store whose LMDB handle already carries a write transaction is passed to
+  `f` as is; whoever opened that transaction adopts its outcome. Otherwise
+  the transaction is opened here, `f` receives a transactional view of
+  `store`, and the datom state that view committed is adopted into `store`
+  once LMDB has committed. Nothing is adopted when `f` throws.
+
+  `f` may commit any number of datom batches. Each of them reads the
+  persisted max-tx through the transaction, so it sees the generations
+  written by the batches before it. `f` runs again from the start, against a
+  fresh view, when LMDB resizes its map."
+  [^Store store f]
+  (locking (.-write-txn store)
+    (let [lmdb (.-lmdb store)]
+      (if (lmdb/writing? lmdb)
+        (f store)
+        (let [committed (volatile! nil)
+              tx-v      (lmdb/write-txn lmdb)
+              ;; LMDB grants a thread one write transaction at a time. Asking
+              ;; for a second one from inside the first would wait in native
+              ;; code forever, and joining the first would leave `store`
+              ;; behind what its owner commits.
+              _         (when (and (Thread/holdsLock tx-v) (some? @tx-v))
+                          (throw
+                           (ex-info
+                            (str "A Datalog commit through a non-transactional "
+                                 "Store was attempted inside this thread's "
+                                 "open write transaction.")
+                            {:type :datalevin/nested-write-transaction
+                             :datalevin/error
+                             :datalevin/nested-write-transaction})))
+              ;; The persisted max-tx continuity read must occur after
+              ;; LMDB grants this environment its cross-process writer
+              ;; lock. Reading before opening this transaction leaves a
+              ;; foreign-writer race between the read and the commit.
+              result    (lmdb/with-transaction-kv [tx-lmdb lmdb]
+                          (let [tx-store ^Store (transfer store tx-lmdb)
+                                result   (f tx-store)]
+                            (vreset! committed
+                                     [(max-tx tx-store) (max-gt tx-store)])
+                            result))
+              [committed-tx committed-max-gt] @committed]
+          ;; Planning against the transactional Store may discover
+          ;; schemaless attributes and allocate giant-value ids.
+          ;; Adopt that committed state only after LMDB commits.
+          (adopt-committed-datom-state!
+           store (load-schema lmdb) committed-max-gt
+           (init-state-sync-ms lmdb))
+          (sync-max-tx-floor! store committed-tx)
+          result)))))
+
 (defn load-datoms-with-plan!
   ([^Store store datoms embedding-plan]
    (load-datoms-with-plan! store datoms embedding-plan nil))
@@ -2836,27 +2890,7 @@
                [res (:secondary-index-job-count plan) (:tx-id plan)
                 (max-gt target)]))]
      (let [[res secondary-index-job-count committed-tx committed-max-gt]
-           (locking (.-write-txn store)
-             (let [lmdb (.-lmdb store)]
-               (if (lmdb/writing? lmdb)
-                 (commit! store)
-                 (let [outcome (volatile! nil)]
-                   ;; The persisted max-tx continuity read must occur after
-                   ;; LMDB grants this environment its cross-process writer
-                   ;; lock. Reading before opening this transaction leaves a
-                   ;; foreign-writer race between the read and the commit.
-                   (lmdb/with-transaction-kv [tx-lmdb lmdb]
-                     (vreset! outcome
-                              (commit! (transfer store tx-lmdb))))
-                   (let [schema* (load-schema lmdb)]
-                     ;; Planning against the transactional Store may discover
-                     ;; schemaless attributes and allocate giant-value ids.
-                     ;; Adopt that committed state only after LMDB commits.
-                     (adopt-committed-datom-state!
-                      store schema* (nth @outcome 3)
-                      (init-state-sync-ms lmdb)))
-                   (sync-max-tx-floor! store (nth @outcome 2))
-                   @outcome))))]
+           (with-datom-write-transaction store commit!)]
      (when (pos? (long (or secondary-index-job-count 0)))
        (enqueue-secondary-index-work! store))
        (when-not (and (= committed-tx (max-tx store))

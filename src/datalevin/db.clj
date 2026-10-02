@@ -1254,8 +1254,12 @@
       (with-bulk-load-direct-write-path
         lmdb
         #(binding [c/*ordered-datom-writes?* true]
-           (l/with-transaction-kv [_ lmdb]
-             (pour store datoms))))
+           ;; Every batch has to commit through the one transaction opened
+           ;; here. Loading through `store` itself would make each batch open
+           ;; a second write transaction on this thread, which LMDB never
+           ;; grants.
+           (s/with-datom-write-transaction
+             store (fn [tx-store] (pour tx-store datoms)))))
       (finally
         (when-not nosync? (set-env-flags lmdb #{:nosync} false))))
     (sync lmdb)))
@@ -1270,7 +1274,16 @@
    (vld/validate-schema-update schema)
    (let [[_ runtime-opts] (split-runtime-opts opts)
          ^Store store    (open-store dir schema opts)]
-     (quick-fill store datoms)
+     (try
+       (quick-fill store datoms)
+       (catch Throwable e
+         ;; No DB is returned for a load that failed, so nothing else could
+         ;; close the store this call opened.
+         (try
+           (close store)
+           (catch Throwable close-error
+             (.addSuppressed e close-error)))
+         (throw e)))
      (cond-> (new-db store)
        (some? runtime-opts) (with-runtime-opts runtime-opts)))))
 

@@ -5,10 +5,12 @@
    [datalevin.constants :as c]
    [datalevin.core :as d]
    [datalevin.db :as db]
+   [datalevin.dump :as dump]
    [datalevin.interface :as i]
    [datalevin.util :as u])
   (:import
-   [java.io File]
+   [java.io DataInputStream DataOutputStream File FileInputStream
+    FileOutputStream PushbackReader StringReader]
    [java.lang ProcessBuilder]))
 
 (def base-schema
@@ -610,3 +612,276 @@
                  #(d/transact! conn [{:app/value "blocked"}]))))))
       (finally
         (close-delete! conn dir)))))
+
+(defn- datom-set
+  "The datoms of `db` as a set of [e a v]."
+  [db]
+  (into #{} (map (juxt :e :a :v)) (d/datoms db :eav)))
+
+(defn- persisted-max-tx
+  "The generation `conn`'s store has persisted. A store that has committed
+  nothing yet is at the first generation."
+  ^long [conn]
+  (long (or (d/get-value (d/datalog-kv conn) c/meta :max-tx :attr :long)
+            c/tx0)))
+
+(defn- store-max-tx
+  [conn]
+  (i/max-tx (:store (d/db conn))))
+
+(defn- commits-next-generation?
+  "True when an ordinary transaction through `conn` commits the generation
+  after the persisted one. A store whose in-memory generation differs from
+  the persisted one rejects the commit instead."
+  [conn]
+  (let [generation (persisted-max-tx conn)
+        report     (d/transact! conn [{:app/value "after the load"}])]
+    (= (inc generation)
+       (:max-tx (:db-after report))
+       (store-max-tx conn)
+       (persisted-max-tx conn))))
+
+(deftest bulk-load-entry-points-commit-and-continue-the-generation
+  (let [datoms [(d/datom 1 :app/value "one") (d/datom 2 :app/value "two")]
+        loaded #{[1 :app/value "one"] [2 :app/value "two"]}]
+    (testing "init-db"
+      (let [dir  (temp-store)
+            conn (d/conn-from-db (d/init-db datoms dir base-schema))]
+        (try
+          (is (= loaded (datom-set (d/db conn))))
+          (is (commits-next-generation? conn))
+          (finally
+            (close-delete! conn dir)))))
+    (testing "conn-from-datoms"
+      (let [dir  (temp-store)
+            conn (d/conn-from-datoms datoms dir base-schema)]
+        (try
+          (is (= loaded (datom-set (d/db conn))))
+          (is (commits-next-generation? conn))
+          (finally
+            (close-delete! conn dir)))))
+    (testing "fill-db"
+      (let [dir  (temp-store)
+            conn (d/create-conn dir base-schema)]
+        (try
+          (is (= loaded (datom-set (d/fill-db (d/db conn) datoms))))
+          (d/refresh-connection! conn)
+          (is (commits-next-generation? conn))
+          (finally
+            (close-delete! conn dir)))))
+    (testing "fill-db inside an explicit transaction"
+      (let [dir  (temp-store)
+            conn (d/create-conn dir base-schema)]
+        (try
+          (d/with-transaction [tx-conn conn]
+            (d/fill-db (d/db tx-conn) datoms))
+          (is (= loaded (datom-set (d/db conn))))
+          (is (commits-next-generation? conn))
+          (finally
+            (close-delete! conn dir)))))
+    (testing "a loaded dump"
+      (let [dir    (temp-store)
+            binary (File/createTempFile "eacl-write-policy" ".nippy")
+            source (d/conn-from-datoms datoms dir base-schema)
+            text   (try
+                     (with-open [out (DataOutputStream.
+                                      (FileOutputStream. binary))]
+                       (dump/dump-datalog source out))
+                     (with-out-str (dump/dump-datalog source))
+                     (finally
+                       (close-delete! source dir)))]
+        (try
+          (doseq [[format load!]
+                  [["as text"
+                    #(dump/load-datalog
+                      % (PushbackReader. (StringReader. text)) {} {})]
+                   ["as nippy"
+                    #(with-open [in (DataInputStream.
+                                     (FileInputStream. binary))]
+                       (dump/load-datalog % in {} {} true))]]]
+            (testing format
+              (let [target (temp-store)]
+                (load! target)
+                (let [conn (d/create-conn target)]
+                  (try
+                    (is (= loaded (datom-set (d/db conn))))
+                    (is (commits-next-generation? conn))
+                    (finally
+                      (close-delete! conn target)))))))
+          (finally
+            (.delete binary)))))
+    (testing "re-index"
+      (let [dir       (temp-store)
+            conn      (d/conn-from-datoms datoms dir base-schema)
+            reindexed (d/re-index conn {})]
+        (try
+          (is (= loaded (datom-set (d/db reindexed))))
+          (is (commits-next-generation? reindexed))
+          (finally
+            (close-delete! reindexed dir)))))))
+
+(deftest bulk-load-in-several-batches-keeps-the-open-store-current
+  (let [dir   (temp-store)
+        conn  (d/create-conn dir base-schema)
+        giant (apply str (repeat 2000 "g"))]
+    (try
+      (d/transact! conn [{:app/value "anchor"}])
+      (let [generation (persisted-max-tx conn)
+            filled     (binding [c/*fill-db-batch-size* 2]
+                         (d/fill-db (d/db conn)
+                                    [(d/datom 10 :app/value "first")
+                                     (d/datom 11 :app/value "second")
+                                     (d/datom 12 :loose/value "untyped")
+                                     (d/datom 13 :app/value giant)
+                                     (d/datom 14 :app/value "fifth")]))]
+        (testing "every batch commits its own generation"
+          (is (= (+ generation 3)
+                 (:max-tx filled)
+                 (store-max-tx conn)
+                 (persisted-max-tx conn))))
+        (testing "an attribute first seen in the load joins the open schema"
+          (is (contains? (d/schema conn) :loose/value)))
+        (d/refresh-connection! conn)
+        (testing "later commits continue from what the load allocated"
+          (let [report (d/transact! conn [{:db/id 15 :app/value (str giant 2)}
+                                          {:db/id 16 :loose/value "more"}])]
+            (is (= (+ generation 4)
+                   (:max-tx (:db-after report))
+                   (persisted-max-tx conn))))
+          (is (= giant (:app/value (d/entity (d/db conn) 13))))
+          (is (= (str giant 2) (:app/value (d/entity (d/db conn) 15))))))
+      (finally
+        (close-delete! conn dir)))))
+
+(deftest bulk-load-across-a-map-resize-commits-every-batch-once
+  (let [dir    (temp-store)
+        ;; A map of one megabyte, which the load outgrows several times over.
+        conn   (d/create-conn dir base-schema {:kv-opts {:mapsize 1}})
+        filler (apply str (repeat 300 "x"))
+        datoms (mapv #(d/datom (+ 100 (long %)) :app/value (str filler %))
+                     (range 20000))]
+    (try
+      (d/transact! conn [{:app/value "anchor"}])
+      (let [generation (persisted-max-tx conn)
+            filled     (binding [c/*fill-db-batch-size* 5000]
+                         (d/fill-db (d/db conn) datoms))]
+        (is (= 20001 (count (d/datoms filled :eav))))
+        (is (< (* 1024 1024) (.length (File. ^String dir "data.mdb"))))
+        (testing "the load starts over when a resized map restarts it"
+          (is (= (+ generation 4)
+                 (:max-tx filled)
+                 (store-max-tx conn)
+                 (persisted-max-tx conn))))
+        (d/refresh-connection! conn)
+        (is (commits-next-generation? conn)))
+      (finally
+        (close-delete! conn dir)))))
+
+(deftest foreign-writer-before-a-bulk-load-breaks-continuity
+  (let [dir  (temp-store)
+        conn (d/create-conn dir base-schema)]
+    (try
+      (d/transact! conn [{:app/value "anchor"}])
+      (run-foreign-writer! dir)
+      (is (= :datalevin/max-tx-continuity-violation
+             (:type
+              (throwable-data
+               #(d/fill-db (d/db conn) [(d/datom 10 :app/value "bulk")])))))
+      (is (= :datalevin/write-unusable
+             (:type
+              (throwable-data
+               #(d/transact! conn [{:app/value "blocked"}])))))
+      (finally
+        (close-delete! conn dir)))))
+
+(deftest bulk-load-entry-points-enforce-a-persisted-policy
+  (let [dir       (temp-store)
+        conn      (d/create-conn dir base-schema)
+        guarded   [(d/datom 20 :app/value "first batch")
+                   (d/datom 21 :guarded/value "unadmitted")]
+        rejection #(:type (throwable-data %))]
+    (try
+      (d/transact! conn [{:app/value "anchor"}])
+      (let [token      (:write-token
+                        (d/install-write-policy! conn (same-entity-policy)))
+            policy     (d/write-policy conn)
+            stored     (datom-set (d/db conn))
+            generation (persisted-max-tx conn)]
+        (testing "fill-db rejects a guarded datom with the batches before it"
+          (is (= :datalevin/guarded-attribute-write
+                 (rejection #(binding [c/*fill-db-batch-size* 1]
+                               (d/fill-db (d/db conn) guarded)))))
+          (is (= stored (datom-set (d/db conn))))
+          (is (= generation (store-max-tx conn) (persisted-max-tx conn))))
+        (testing "the administrative token does not admit datoms"
+          (is (= :datalevin/guarded-attribute-write
+                 (rejection #(d/with-write-policy-token
+                              conn token
+                              (fn [] (d/fill-db (d/db conn) guarded)))))))
+        (testing "fill-db loads datoms that the policy does not guard"
+          (is (= (conj stored [22 :app/value "ordinary"])
+                 (datom-set
+                  (d/fill-db (d/db conn) [(d/datom 22 :app/value "ordinary")]))))
+          (d/refresh-connection! conn)
+          (is (some? (d/transact! conn
+                                  [{:guarded/value "admitted"
+                                    :guarded/gen :db/current-tx}]
+                                  {:datalevin/write-token token}))))
+        (let [stored (datom-set (d/db conn))]
+          (d/close conn)
+          (testing "a closed store rejects a guarded datom from"
+            (testing "init-db"
+              (is (= :datalevin/guarded-attribute-write
+                     (rejection #(d/init-db guarded dir)))))
+            (testing "conn-from-datoms"
+              (is (= :datalevin/guarded-attribute-write
+                     (rejection #(d/conn-from-datoms guarded dir)))))
+            (testing "a loaded dump"
+              (is (thrown?
+                   Exception
+                   (dump/load-datalog
+                    dir
+                    (PushbackReader.
+                     (StringReader.
+                      "{} {} [21 :guarded/value \"unadmitted\"]"))
+                    {} {})))))
+          (testing "and is left unchanged and closed by the rejected load"
+            (let [reopened (d/create-conn dir)
+                  kv       (d/datalog-kv reopened)]
+              (is (= stored (datom-set (d/db reopened))))
+              (is (= policy (d/write-policy reopened)))
+              (d/close reopened)
+              (is (d/closed-kv? kv))))
+          (testing "init-db loads datoms that the policy does not guard"
+            (let [reopened (d/conn-from-db
+                            (d/init-db [(d/datom 23 :app/value "more")] dir))]
+              (try
+                (is (= (conj stored [23 :app/value "more"])
+                       (datom-set (d/db reopened))))
+                (is (= policy (d/write-policy reopened)))
+                (is (commits-next-generation? reopened))
+                (finally
+                  (d/close reopened)))))))
+      (finally
+        (close-delete! conn dir)))))
+
+(deftest bulk-load-inside-a-kv-transaction-fails-instead-of-stalling
+  (let [dir     (temp-store)
+        conn    (d/create-conn dir base-schema)
+        kv      (d/datalog-kv conn)
+        nested  (future
+                  (throwable-data
+                   #(d/with-transaction-kv [_ kv]
+                      (d/fill-db (d/db conn)
+                                 [(d/datom 1 :app/value "nested")]))))
+        outcome (deref nested 60000 ::stalled)]
+    ;; A load that stalled holds the environment's write lock for good, so
+    ;; the store can be written and closed only when the load returned.
+    (if (= ::stalled outcome)
+      (is false "the nested bulk load did not return")
+      (try
+        (is (= :datalevin/nested-write-transaction (:type outcome)))
+        (is (empty? (datom-set (d/db conn))))
+        (is (commits-next-generation? conn))
+        (finally
+          (close-delete! conn dir))))))

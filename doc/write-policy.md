@@ -128,6 +128,25 @@ at once, so they are treated as touching every frozen attribute. Their
 rejection carries the `:operation`, and the `:dbi-name` when there is one,
 instead of `:attributes`.
 
+## Bulk loads
+
+`init-db`, `conn-from-datoms`, `fill-db` and loading a dump write their datoms
+in batches of `datalevin.constants/*fill-db-batch-size*`, all inside one write
+transaction. The policy is enforced on each batch as it is on the datoms of a
+transaction. A rejected batch rejects the whole load: none of its batches is
+committed, the open store keeps its generation, and a store that `init-db` or
+`conn-from-datoms` opened for the load is closed again.
+
+A bulk load has no `tx-meta`, and the administrative binding does not admit
+datoms, so a bulk load cannot write a guarded attribute. Guarded datoms are
+written by transactions.
+
+`fill-db` on the database of an enclosing `with-transaction` joins that
+transaction. A bulk load started on a thread that holds another write
+transaction on the same store, such as a caller's `with-transaction-kv`, is
+rejected with `:datalevin/nested-write-transaction`: its commit would have to
+open a second write transaction, which LMDB never grants to one thread.
+
 ## Commit-generation continuity
 
 After obtaining LMDB's cross-process writer lock, every Datalog commit reads
@@ -139,13 +158,18 @@ that advanced the generation from a separate in-memory allocator. The
 committing generation, every commit-generation datom, and the persisted
 post-commit `:max-tx` are required to be equal.
 
+Each batch of a bulk load is such a commit and takes one generation. The
+batches read the persisted `:max-tx` through the transaction they share, so
+every batch sees the generations of the batches before it, and the open store
+adopts the last of them when that transaction has committed.
+
 ## Entry points and boundary
 
 The check covers synchronous and asynchronous transactions, blocking
-transactions, explicit `with-transaction`, direct `transact-tx-data`, and the
-blind map fast path. Speculative `with` results do not commit and are exempt.
-Transactions that touch no guarded attribute remain ordinary Datalevin
-transactions.
+transactions, explicit `with-transaction`, direct `transact-tx-data`, the
+blind map fast path, and the batches of a bulk load. Speculative `with`
+results do not commit and are exempt. Transactions that touch no guarded
+attribute remain ordinary Datalevin transactions.
 
 The boundary assumes all Datalog writes use this fork. Raw KV mutation of the
 datom/meta DBIs, direct file modification, and opening the directory with an
