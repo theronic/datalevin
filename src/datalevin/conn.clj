@@ -1147,6 +1147,10 @@
        (let [~(first spec) db#] ~@body)
        (finally (i/close-kv db#)))))
 
+(def ^:no-doc datalog-dbis
+  "The DBIs that hold a Datalog database's data and schema."
+  [c/eav c/ave c/giants c/ha-client-ops c/schema c/meta])
+
 (defn clear
   "Close the Datalog database, then clear all data, including schema."
   [conn]
@@ -1157,7 +1161,7 @@
                   (open-kv dir))
                 (.-lmdb ^Store store))]
     (try
-      (doseq [dbi [c/eav c/ave c/giants c/ha-client-ops c/schema c/meta]]
+      (doseq [dbi datalog-dbis]
         (i/clear-dbi lmdb dbi))
       (finally
         (db/remove-cache store)

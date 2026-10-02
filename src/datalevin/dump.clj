@@ -28,8 +28,8 @@
    [datalevin.datom Datom]
    [datalevin.storage Store]
    [datalevin.remote DatalogStore]
-   [java.io PushbackReader FileOutputStream FileInputStream DataOutputStream
-    DataInputStream IOException]))
+   [java.io File PushbackReader FileOutputStream FileInputStream
+    DataOutputStream DataInputStream IOException]))
 
 (def ^:private mixed-dump-format-key
   :datalevin/dump-format)
@@ -403,22 +403,87 @@
 
 (defn- load
   [dir schema opts ^String dumpfile]
-  (let [f  (FileInputStream. dumpfile)
-        in (DataInputStream. f)]
-    (load-datalog dir in schema opts true)
-    (.close f)))
+  (with-open [f (FileInputStream. dumpfile)]
+    (load-datalog dir (DataInputStream. f) schema opts true)))
+
+(defn- clear-datalog
+  "Empty the Datalog DBIs through `lmdb` and close it, as `conn/clear` does,
+  but leave the store at the transaction generation `max-tx`.
+
+  A store that restarted from the first generation would commit generations
+  again that it has already handed out, and that its commit-generation datoms
+  still carry."
+  [lmdb max-tx]
+  (try
+    (doseq [dbi conn/datalog-dbis]
+      (i/clear-dbi lmdb dbi))
+    (when max-tx
+      (i/transact-kv
+        lmdb [(l/kv-tx :put c/meta :max-tx max-tx :attr :long)]))
+    (finally
+      (i/close-kv lmdb))))
+
+(defn- reload
+  "Clear the store at `dir` through `lmdb`, an open handle on it that is
+  closed here, then load `dumpfile`, a dump of that same store, back into it
+  at the generation `max-tx`."
+  [lmdb max-tx dir schema opts dumpfile]
+  (clear-datalog lmdb max-tx)
+  (load dir schema opts dumpfile))
+
+(defn- unrestored
+  "The error of a re-index that cleared the store at `dir` and could neither
+  reload it nor load its previous contents back. The dump is moved out of the
+  way of the next re-index, which would overwrite the only copy of the data."
+  [dir ^String dumpfile ^Throwable reload-error ^Throwable restore-error]
+  (let [kept (str dumpfile "-" (System/currentTimeMillis))
+        kept (if (.renameTo (File. dumpfile) (File. kept)) kept dumpfile)]
+    (doto ^Throwable
+          (ex-info
+            (str "Unable to re-index Datalog database, and unable to load "
+                 "its previous contents back. They are in " kept)
+            {:type            :datalevin/re-index-unrestored
+             :datalevin/error :datalevin/re-index-unrestored
+             :dir             dir
+             :dump            kept}
+            reload-error)
+      (.addSuppressed restore-error))))
 
 (defn re-index-datalog
   [conn schema opts]
-  (let [d (dir (.-store ^DB @conn))]
+  (let [^Store store (.-store ^DB @conn)
+        lmdb         (.-lmdb store)
+        d            (dir store)]
+    ;; The reload is exempt from the write policy, so the operation is
+    ;; admitted here, ahead of its first write, whoever the caller is.
+    (write-policy/assert-admin-admitted! (i/kv-info lmdb) :re-index)
     (try
-      (let [dumpfile (str d u/+separator+ "dl-dump")]
+      (let [dumpfile (str d u/+separator+ "dl-dump")
+            kv-opts  (:kv-opts (conn/opts conn))
+            max-tx   (i/get-value lmdb c/meta :max-tx :attr :long)]
         (dump conn dumpfile)
-        (conn/clear conn)
-        (load d schema opts dumpfile)
+        (db/remove-cache store)
+        ;; The dump holds what the store had already admitted, so loading it
+        ;; back is not checked against the write policy a second time.
+        (write-policy/with-restore
+          d
+          (fn []
+            (try
+              (reload lmdb max-tx d schema opts dumpfile)
+              (catch Throwable e
+                ;; Only the dump holds the data once the first DBI is
+                ;; cleared. Load it back as it was taken rather than leave
+                ;; the store cleared.
+                (try
+                  (reload (l/open-kv d kv-opts) max-tx d nil nil dumpfile)
+                  (catch Throwable restore-error
+                    (throw (unrestored d dumpfile e restore-error))))
+                (throw e)))))
         (conn/create-conn d))
       (catch Exception e
-        (u/raise "Unable to re-index Datalog database" e {:dir d})))))
+        (if (= :datalevin/re-index-unrestored (:type (ex-data e)))
+          (throw e)
+          (u/raise "Unable to re-index Datalog database" e {:dir d}))))))
 
 (defn copy
   ([db dest]

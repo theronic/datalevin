@@ -12,7 +12,9 @@
   (:require
    [clojure.set :as set]
    [datalevin.constants :as c]
-   [datalevin.datom :as d]))
+   [datalevin.datom :as d])
+  (:import
+   [java.io File]))
 
 (def persisted-policy-key :datalevin/write-policy)
 (def runtime-token-key :datalevin.write-policy/admission-token)
@@ -149,6 +151,37 @@
   (binding [*admin-write-token* token]
     (f)))
 
+(def ^:dynamic ^:private *restoring-dir*
+  "Canonical directory of the store whose own dump the calling thread is
+  loading back, or nil."
+  nil)
+
+(defn- canonical-dir
+  [dir]
+  (.getCanonicalPath (File. ^String dir)))
+
+(defn with-restore
+  "Call `f` while the calling thread loads the dump of the store at `dir` back
+  into that store.
+
+  The dumped schema and datoms were admitted when they were first written, and
+  the dump was taken by an operation that was itself admitted before it cleared
+  the store. Loading them back is therefore not checked against the policy a
+  second time: the environment that receives them has a new admission token
+  that the caller cannot hold, and the stored commit generations are older
+  than the generation that loads them. Environments at other directories are
+  checked as usual."
+  [dir f]
+  (binding [*restoring-dir* (canonical-dir dir)]
+    (f)))
+
+(defn- restoring?
+  [info]
+  (boolean
+   (when-let [restoring *restoring-dir*]
+     (when-let [dir (:dir @info)]
+       (= restoring (canonical-dir dir))))))
+
 (defn assert-admin-admitted!
   ([info operation]
    (assert-admin-admitted! info operation nil))
@@ -159,6 +192,7 @@
                          (or (nil? dbi-name)
                              (contains? protected-datalog-dbis dbi-name)))]
      (when (and protected?
+                (not (restoring? info))
                 (not= (runtime-token info) *admin-write-token*))
        (policy-error
         "A frozen Datalevin write policy rejected an administrative mutation."
@@ -174,6 +208,7 @@
           (set/intersection (:frozen-attributes policy)
                             (set touched-attributes)))]
     (when (and (seq protected)
+               (not (restoring? info))
                (not= (runtime-token info) *admin-write-token*))
       (policy-error
        "A frozen Datalevin write policy rejected a schema mutation."
@@ -215,7 +250,7 @@
 
 (defn enforce-datoms!
   [info datoms committing-generation tx-meta]
-  (when-let [policy (persisted-policy info)]
+  (when-let [policy (when-not (restoring? info) (persisted-policy info))]
     (let [guarded (:guarded-attributes policy)
           guarded-datoms (filterv #(contains? guarded (d/datom-a %)) datoms)]
       (when (and (seq guarded-datoms) (not (admitted? info tx-meta)))

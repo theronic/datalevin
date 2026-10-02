@@ -2214,7 +2214,8 @@ This function is eager and attempts to load all matching data in range into memo
   `true` or an exception will be thrown.
 
   If `db` is a Datalog connection, `schema` can be used to supply a
-  new schema.
+  new schema. Should the reload fail, the dumped data is loaded back with the
+  schema and options it had before the exception is thrown.
 
   This function is only safe to call when other threads or programs are
   not accessing the same `db`."}

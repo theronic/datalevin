@@ -63,7 +63,8 @@ dynamic binding around queued transaction work:
 ```
 
 Normal Datalog transactions must use `tx-meta`; the administrative binding
-does not admit them.
+does not admit them. [Re-indexing](#re-indexing) describes what an admitted
+re-index keeps.
 
 ## What an operation touches
 
@@ -139,13 +140,58 @@ committed, the open store keeps its generation, and a store that `init-db` or
 
 A bulk load has no `tx-meta`, and the administrative binding does not admit
 datoms, so a bulk load cannot write a guarded attribute. Guarded datoms are
-written by transactions.
+written by transactions; only the reload of a [re-index](#re-indexing) loads
+them in bulk.
 
 `fill-db` on the database of an enclosing `with-transaction` joins that
 transaction. A bulk load started on a thread that holds another write
 transaction on the same store, such as a caller's `with-transaction-kv`, is
 rejected with `:datalevin/nested-write-transaction`: its commit would have to
 open a second write transaction, which LMDB never grants to one thread.
+
+## Re-indexing
+
+`re-index` dumps the store, clears it, loads the dump back and returns a new
+connection. The operation is admitted once, before it writes anything: it
+needs the token when the policy has frozen attributes, and no token otherwise.
+
+The dump is the store's own data, which the policy admitted when it was first
+written. Loading it back is therefore not checked against the policy again:
+
+- guarded datoms are loaded back without a token, and stamp rules are not
+  applied to them;
+- commit-generation datoms keep their stored values;
+- frozen attributes are created again as they were dumped, or as the schema
+  given to the re-index changes them.
+
+The policy stays installed, and the generation is not restarted: the clear
+keeps the persisted `:max-tx` and the reload commits the generations after
+it, so no generation is committed twice. The returned connection belongs to a
+newly opened environment. It has a new token, and the token that admitted the
+re-index is no longer valid.
+
+```clojure
+(let [conn  (d/with-write-policy-token
+             conn write-token
+             #(d/re-index conn {}))
+      token (:write-token (d/install-write-policy! conn policy))]
+  (d/transact! conn tx-data {:datalevin/write-token token}))
+```
+
+A re-index that fails after it cleared the store, for example because the
+schema it was given does not fit the stored values, loads the dump back with
+the schema and options it was taken with, and then throws. The store holds
+the datoms, schema and policy it held before, and its generation has not gone
+back. The connection that was passed in is closed.
+
+If the dump cannot be loaded back either, the error is
+`:datalevin/re-index-unrestored`. The store is then cleared. `:dump` in the
+error data names the file that holds its options, schema and datoms. The file
+is moved aside, from `dl-dump` to `dl-dump-<timestamp>` in the store
+directory, so that a later re-index does not overwrite it. Loading it by hand
+is a bulk load: the store's policy rejects its guarded datoms, and a new
+directory accepts it but starts without the policy and from the first
+generation.
 
 ## Commit-generation continuity
 
@@ -163,6 +209,10 @@ batches read the persisted `:max-tx` through the transaction they share, so
 every batch sees the generations of the batches before it, and the open store
 adopts the last of them when that transaction has committed.
 
+The reload of a re-index is the one commit whose commit-generation datoms
+differ from the committing generation: they are loaded back with the values
+they were stored with.
+
 ## Entry points and boundary
 
 The check covers synchronous and asynchronous transactions, blocking
@@ -175,3 +225,11 @@ The boundary assumes all Datalog writes use this fork. Raw KV mutation of the
 datom/meta DBIs, direct file modification, and opening the directory with an
 upstream binary that does not implement the policy are outside the contract.
 LMDB `:nolock` is incompatible with the continuity guarantee.
+
+A dump holds a store's options, schema and datoms. It holds neither the
+policy nor the generation, so a dump loaded into another directory creates a
+store without a policy whose generation starts anew.
+
+A re-index is not atomic. A process that stops between the clear and the end
+of the reload leaves the store cleared, with its data in `dl-dump` in the
+store directory.

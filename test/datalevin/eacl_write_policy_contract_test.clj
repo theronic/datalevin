@@ -7,7 +7,8 @@
    [datalevin.db :as db]
    [datalevin.dump :as dump]
    [datalevin.interface :as i]
-   [datalevin.util :as u])
+   [datalevin.util :as u]
+   [taoensso.nippy :as nippy])
   (:import
    [java.io DataInputStream DataOutputStream File FileInputStream
     FileOutputStream PushbackReader StringReader]
@@ -711,11 +712,13 @@
           (finally
             (.delete binary)))))
     (testing "re-index"
-      (let [dir       (temp-store)
-            conn      (d/conn-from-datoms datoms dir base-schema)
-            reindexed (d/re-index conn {})]
+      (let [dir        (temp-store)
+            conn       (d/conn-from-datoms datoms dir base-schema)
+            generation (persisted-max-tx conn)
+            reindexed  (d/re-index conn {})]
         (try
           (is (= loaded (datom-set (d/db reindexed))))
+          (is (< generation (persisted-max-tx reindexed)))
           (is (commits-next-generation? reindexed))
           (finally
             (close-delete! reindexed dir)))))))
@@ -885,3 +888,179 @@
         (is (commits-next-generation? conn))
         (finally
           (close-delete! conn dir))))))
+
+(defn- definitions
+  "The schema of `conn` without the attribute ids that storage assigns."
+  [conn]
+  (update-vals (d/schema conn) #(dissoc % :db/aid)))
+
+(defn- contents
+  "What a re-index has to keep of the store behind `conn`."
+  [conn]
+  {:datoms (datom-set (d/db conn))
+   :schema (definitions conn)
+   :policy (d/write-policy conn)})
+
+(defn- stamped-store
+  "Open a new store at `dir` that holds an ordinary datom and, under `policy`,
+  a guarded entity with its commit-generation stamp."
+  [dir policy]
+  (let [conn    (d/create-conn dir base-schema)
+        _       (d/transact! conn [{:app/value "ordinary"}])
+        token   (:write-token (d/install-write-policy! conn policy))
+        stamped (:e (first (:tx-data
+                            (d/transact!
+                             conn
+                             [{:guarded/value "guarded"
+                               :guarded/gen :db/current-tx}]
+                             {:datalevin/write-token token}))))]
+    {:conn conn :token token :stamped stamped}))
+
+(defn- restamp!
+  [conn stamped tx-meta]
+  (d/transact! conn
+               [[:db/add stamped :guarded/value "changed"]
+                [:db/add stamped :guarded/gen :db/current-tx]]
+               tx-meta))
+
+(deftest admitted-re-index-keeps-data-schema-policy-and-generation
+  (let [dir (temp-store)
+        {:keys [conn token stamped]} (stamped-store dir (same-entity-policy))]
+    (try
+      (let [kept       (contents conn)
+            generation (persisted-max-tx conn)
+            reindexed  (d/with-write-policy-token
+                        conn token #(d/re-index conn {}))]
+        (try
+          (is (= kept (contents reindexed)))
+          (testing "a stored commit generation is loaded back as it was"
+            (is (= generation
+                   (:guarded/gen (d/entity (d/db reindexed) stamped)))))
+          (testing "the store continues its generation instead of restarting"
+            (is (< generation (persisted-max-tx reindexed)))
+            (is (= (persisted-max-tx reindexed)
+                   (store-max-tx reindexed)
+                   (:max-tx (d/db reindexed)))))
+          (testing "the reopened environment guards the store under a new token"
+            (let [new-token (:write-token
+                             (d/install-write-policy!
+                              reindexed (same-entity-policy)))]
+              (is (not= token new-token))
+              (is (= :datalevin/guarded-attribute-write
+                     (:type (throwable-data
+                             #(restamp! reindexed stamped
+                                        {:datalevin/write-token token})))))
+              (is (< generation
+                     (:guarded/gen
+                      (d/entity
+                       (:db-after
+                        (restamp! reindexed stamped
+                                  {:datalevin/write-token new-token}))
+                       stamped))))
+              (testing "which also admits a schema that changes a frozen one"
+                (let [datoms  (datom-set (d/db reindexed))
+                      changed (d/with-write-policy-token
+                               reindexed new-token
+                               #(d/re-index
+                                 reindexed
+                                 {:guarded/value {:db/valueType :db.type/string
+                                                  :db/index     true}}
+                                 {}))]
+                  (try
+                    (is (= datoms (datom-set (d/db changed))))
+                    (is (true? (get-in (d/schema changed)
+                                       [:guarded/value :db/index])))
+                    (finally
+                      (d/close changed)))))))
+          (finally
+            (d/close reindexed))))
+      (finally
+        (close-delete! conn dir)))))
+
+(deftest re-index-without-frozen-attributes-needs-no-token
+  (let [dir (temp-store)
+        {:keys [conn stamped]}
+        (stamped-store dir (assoc (same-entity-policy) :frozen-attributes #{}))]
+    (try
+      (let [kept       (contents conn)
+            generation (persisted-max-tx conn)
+            reindexed  (d/re-index conn {})]
+        (try
+          (is (= kept (contents reindexed)))
+          (is (= generation
+                 (:guarded/gen (d/entity (d/db reindexed) stamped))))
+          (is (< generation (persisted-max-tx reindexed)))
+          (finally
+            (d/close reindexed))))
+      (finally
+        (close-delete! conn dir)))))
+
+(deftest re-index-is-admitted-before-its-first-write
+  (let [dir (temp-store)
+        {:keys [conn]} (stamped-store dir (same-entity-policy))]
+    (try
+      (let [kept (contents conn)]
+        (testing "also when entered below the public function, as a server does"
+          (is (= :datalevin/frozen-attribute-write
+                 (:type (throwable-data
+                         #(dump/re-index-datalog conn {} {}))))))
+        (is (not (d/closed? conn)))
+        (is (= kept (contents conn)))
+        (is (not (.exists (File. ^String dir "dl-dump")))))
+      (finally
+        (close-delete! conn dir)))))
+
+(deftest failed-re-index-puts-the-previous-contents-back
+  (doseq [[cause schema opts]
+          [["a schema that the stored values do not satisfy"
+            {:app/value {:db/valueType :db.type/long}} {}]
+           ["options that the store cannot be opened with"
+            {} {:search-opts :not-a-map}]]]
+    (testing cause
+      (let [dir (temp-store)
+            {:keys [conn token stamped]}
+            (stamped-store dir (same-entity-policy))]
+        (try
+          (let [kept       (contents conn)
+                generation (persisted-max-tx conn)]
+            (is (thrown? Exception
+                         (d/with-write-policy-token
+                          conn token #(d/re-index conn schema opts))))
+            (let [reopened (d/create-conn dir)]
+              (try
+                (is (= kept (contents reopened)))
+                (testing "at a generation that is not behind the stored ones"
+                  (is (<= generation (persisted-max-tx reopened))))
+                (testing "and still writable by an admitted writer"
+                  (is (some?
+                       (restamp!
+                        reopened stamped
+                        {:datalevin/write-token
+                         (:write-token
+                          (d/install-write-policy!
+                           reopened (same-entity-policy)))}))))
+                (finally
+                  (d/close reopened)))))
+          (finally
+            (close-delete! conn dir)))))))
+
+(deftest re-index-that-cannot-put-the-contents-back-names-their-dump
+  (let [dir (temp-store)
+        {:keys [conn token]} (stamped-store dir (same-entity-policy))]
+    (try
+      (let [datoms (datom-set (d/db conn))
+            ;; No batch size below one can load anything, so neither the
+            ;; reload nor putting the dump back succeeds.
+            data   (binding [c/*fill-db-batch-size* 0]
+                     (throwable-data
+                      #(d/with-write-policy-token
+                        conn token (fn [] (d/re-index conn {})))))]
+        (is (= :datalevin/re-index-unrestored (:type data)))
+        (is (= dir (:dir data)))
+        (testing "a dump that holds every datom of the cleared store"
+          (is (= datoms
+                 (with-open [in (DataInputStream.
+                                 (FileInputStream. ^String (:dump data)))]
+                   (set (nth (nippy/thaw-from-in! in) 2)))))))
+      (finally
+        (close-delete! conn dir)))))
