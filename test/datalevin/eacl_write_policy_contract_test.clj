@@ -7,6 +7,7 @@
    [datalevin.db :as db]
    [datalevin.util :as u])
   (:import
+   [java.io File]
    [java.lang ProcessBuilder]))
 
 (def base-schema
@@ -72,6 +73,11 @@
       (d/schema conn)
       (finally
         (d/close conn)))))
+
+(defn- shared-store-refs
+  [dir]
+  (get-in @@#'conn/shared-local-stores
+          [(.getCanonicalPath (File. ^String dir)) :refs]))
 
 (deftest policy-capabilities-persist-and-token-rotates-on-reopen
   (let [dir (temp-store)
@@ -434,6 +440,42 @@
         (is (= :datalevin/frozen-attribute-write (:type data)))
         (is (= #{:pair/both} (:attributes data))))
       (is (nil? (get-in (d/schema conn) [:pair/left :db/valueType])))
+      (finally
+        (close-delete! conn dir)))))
+
+(deftest rejected-second-connection-keeps-the-shared-store-reference-count
+  (let [dir (temp-store)
+        other-spelling (str dir "/.")
+        conn (d/create-conn dir base-schema)]
+    (try
+      (let [token (:write-token
+                   (d/install-write-policy! conn (same-entity-policy)))
+            kv (d/datalog-kv conn)]
+        (is (= 1 (shared-store-refs dir)))
+        (testing "a rejected connection is not counted"
+          (is (= :datalevin/frozen-attribute-write
+                 (:type (rejected-open other-spelling redefining-schema))))
+          (is (= 1 (shared-store-refs dir)))
+          (is (some? (d/transact! conn [{:app/value "still open"}]))))
+        (testing "an admitted connection is counted until it closes"
+          (let [second-conn (d/create-conn other-spelling grown-schema)]
+            (try
+              (is (= 2 (shared-store-refs dir)))
+              (finally
+                (d/close second-conn))))
+          (is (= 1 (shared-store-refs dir))))
+        (testing "the last connection closes the environment"
+          (d/close conn)
+          (is (nil? (shared-store-refs dir)))
+          (is (d/closed-kv? kv))
+          (let [reopened (d/create-conn dir)]
+            (try
+              (is (not= token
+                        (:write-token
+                         (d/install-write-policy!
+                          reopened (same-entity-policy)))))
+              (finally
+                (d/close reopened))))))
       (finally
         (close-delete! conn dir)))))
 

@@ -148,9 +148,11 @@
               (swap! shared-local-stores dissoc dir-key)
               (recur))
             (do
-              (swap! shared-local-stores update-in [dir-key :refs] inc)
               (when schema
                 (i/set-schema store schema))
+              ;; Count the reference only once the schema is admitted, so a
+              ;; rejected open cannot keep the store from closing.
+              (swap! shared-local-stores update-in [dir-key :refs] inc)
               store))
           (let [store (s/open dir schema store-opts)]
             (swap! shared-local-stores
