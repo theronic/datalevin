@@ -755,13 +755,19 @@
     (if-not (lmdb/writing? lmdb)
       ;; Route direct callers through the same serialized, atomic operation.
       (datalevin.interface/set-schema this new-schema nil nil)
-      (let [new-schema (prepare-schema-update schema new-schema)]
+      (let [new-schema (prepare-schema-update schema new-schema)
+            touched    (seq (touched-schema-attrs schema new-schema))]
         (when (seq new-schema)
           (vld/validate-schema (merge schema new-schema)))
         (doseq [[attr new] new-schema
                 :let       [old (schema attr)]
                 :when      old]
           (check this attr old new))
+        ;; Admit the update before its first write. Re-encoding is a raw KV
+        ;; write that a caller-owned transaction would otherwise commit if
+        ;; the caller caught a later rejection.
+        (when touched
+          (write-policy/assert-schema-admitted! (kv-info lmdb) touched))
         (doseq [[attr new] new-schema
                 :let       [old (schema attr)]
                 :when      old
@@ -771,8 +777,7 @@
                                 (not (identical? new-vt :data)))]
           ;; Re-encode stored values before persisting schema change.
           (migrate-attr-values this attr new-vt))
-        (when-let [touched (seq (touched-schema-attrs schema new-schema))]
-          (write-policy/assert-schema-admitted! (kv-info lmdb) touched)
+        (when touched
           ;; `new-schema` is already the complete effective definition for
           ;; every updated attribute. Persist it directly so an explicitly
           ;; retracted property is not reintroduced by applying the patch a
@@ -2060,6 +2065,14 @@
                                (when pending? [old new])))
                     rename-plans)]
           (vld/validate-schema final-schema)
+          ;; Admit the whole operation before its first write, so a rejected
+          ;; deletion or rename cannot leave an earlier step behind.
+          (write-policy/assert-schema-admitted!
+            (kv-info (.-lmdb store))
+            (concat (touched-schema-attrs current-schema prepared-update)
+                    deletions-to-apply
+                    (keys renames-to-apply)
+                    (vals renames-to-apply)))
           {:schema-update resolved-update
            :del-attrs     deletions-to-apply
            :rename-map    renames-to-apply

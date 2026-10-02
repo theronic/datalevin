@@ -103,10 +103,16 @@ and only they are written.
 ```
 
 A rejected schema operation throws `:datalevin/frozen-attribute-write`, whose
-`:attributes` name the frozen attributes it was rejected for. A rejected
-schema map writes none of its attribute definitions. A connection whose
-schema map is rejected is not opened and keeps no reference to the store, so
-it cannot hold the environment open after the other connections close.
+`:attributes` name every frozen attribute the operation would have changed.
+
+The whole operation (its schema map, deletions and renames together) is
+checked after validation and before its first write. A rejected operation is
+therefore not applied in part: no attribute is created, changed, deleted or
+renamed, and no stored value is re-encoded for a new value type, even when
+the rejection is caught inside a transaction that the caller then commits. A
+connection whose schema map is rejected is not opened and keeps no reference
+to the store, so it cannot hold the environment open after the other
+connections close.
 
 An attribute admitted this way is an ordinary attribute. Admission does not
 extend the persisted policy, so the attribute is neither guarded nor frozen

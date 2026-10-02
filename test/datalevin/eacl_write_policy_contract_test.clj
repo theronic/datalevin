@@ -5,6 +5,7 @@
    [datalevin.constants :as c]
    [datalevin.core :as d]
    [datalevin.db :as db]
+   [datalevin.interface :as i]
    [datalevin.util :as u])
   (:import
    [java.io File]
@@ -442,6 +443,84 @@
       (is (nil? (get-in (d/schema conn) [:pair/left :db/valueType])))
       (finally
         (close-delete! conn dir)))))
+
+(deftest rejected-frozen-retype-does-not-re-encode-stored-values
+  (let [dir (temp-store)
+        first-conn (d/create-conn
+                    dir {:untyped/value {:db/cardinality :db.cardinality/one}})
+        policy {:guarded-attributes #{}
+                :frozen-attributes #{:untyped/value}
+                :commit-generation-attributes #{}
+                :stamp-rules []}
+        retype {:untyped/value {:db/valueType :db.type/string}}
+        stored-eid (fn [conn]
+                     (d/q '[:find ?e .
+                            :where [?e :untyped/value "stored"]]
+                          (d/db conn)))]
+    (try
+      (let [eid (:e (first (:tx-data
+                            (d/transact! first-conn
+                                         [{:untyped/value "stored"}]))))]
+        (d/install-write-policy! first-conn policy)
+        (testing "a rejection caught inside a transaction that then commits"
+          (doseq [submit [#(d/update-schema % retype)
+                          ;; the entry a server uses inside a transaction
+                          #(i/set-schema (:store @%) retype)]]
+            (let [data (d/with-transaction [tx-conn first-conn]
+                         (throwable-data #(submit tx-conn)))]
+              (is (= :datalevin/frozen-attribute-write (:type data)))
+              (is (= #{:untyped/value} (:attributes data))))))
+        (d/close first-conn)
+        (let [conn (d/create-conn dir)]
+          (try
+            (testing "leaves the value findable under its stored encoding"
+              (is (= eid (stored-eid conn))))
+            (d/update-schema
+             conn retype nil nil
+             {:datalevin/write-token
+              (:write-token (d/install-write-policy! conn policy))})
+            (finally
+              (d/close conn))))
+        (testing "while the admitted retype re-encodes it"
+          (let [conn (d/create-conn dir)]
+            (try
+              (is (= :db.type/string
+                     (get-in (d/schema conn) [:untyped/value :db/valueType])))
+              (is (= eid (stored-eid conn)))
+              (finally
+                (d/close conn))))))
+      (finally
+        (close-delete! first-conn dir)))))
+
+(deftest rejected-update-schema-applies-none-of-its-steps
+  (let [dir (temp-store)
+        first-conn (d/create-conn dir base-schema)
+        extension {:extension/value {:db/valueType :db.type/string}}
+        caught (fn [& update-args]
+                 (d/with-transaction [tx-conn first-conn]
+                   (throwable-data
+                    #(apply d/update-schema tx-conn update-args))))]
+    (try
+      (d/install-write-policy! first-conn (same-entity-policy))
+      (let [stored (d/schema first-conn)]
+        (testing "a frozen rename after an admitted schema map"
+          (is (= #{:guarded/value}
+                 (:attributes
+                  (caught extension nil {:guarded/value :guarded/renamed})))))
+        (testing "a frozen deletion after an admitted schema map"
+          (is (= #{:guarded/gen}
+                 (:attributes (caught extension #{:guarded/gen})))))
+        (testing "every frozen attribute the call would touch is named"
+          (is (= #{:guarded/value :guarded/gen}
+                 (:attributes
+                  (caught {:guarded/value
+                           {:db/cardinality :db.cardinality/many}}
+                          #{:guarded/gen})))))
+        (d/close first-conn)
+        (testing "the transactions that committed applied nothing"
+          (is (= stored (stored-schema dir)))))
+      (finally
+        (close-delete! first-conn dir)))))
 
 (deftest rejected-second-connection-keeps-the-shared-store-reference-count
   (let [dir (temp-store)
