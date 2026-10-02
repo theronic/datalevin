@@ -49,6 +49,30 @@
                   :stamp-attribute :guarded/gen
                   :stamp-entity :same-entity}]})
 
+(def grown-schema
+  "`base-schema` re-declared unchanged beside one new attribute."
+  (assoc base-schema :extension/value {:db/valueType :db.type/string}))
+
+(def redefining-schema
+  "`grown-schema` with the definition of one frozen attribute changed."
+  (assoc-in grown-schema
+            [:guarded/value :db/cardinality] :db.cardinality/many))
+
+(defn- rejected-open
+  "The typed error data of a rejected `create-conn`. An admitted connection
+  is closed and yields nil."
+  [dir schema]
+  (throwable-data #(d/close (d/create-conn dir schema))))
+
+(defn- stored-schema
+  "The schema of a closed store, read without submitting a schema map."
+  [dir]
+  (let [conn (d/create-conn dir)]
+    (try
+      (d/schema conn)
+      (finally
+        (d/close conn)))))
+
 (deftest policy-capabilities-persist-and-token-rotates-on-reopen
   (let [dir (temp-store)
         first-conn (d/create-conn dir base-schema)]
@@ -335,6 +359,81 @@
                (:type
                 (throwable-data
                  #(d/re-index conn {})))))
+      (finally
+        (close-delete! conn dir)))))
+
+(deftest schema-at-open-touches-only-the-attributes-it-changes
+  (let [dir (temp-store)
+        first-conn (d/create-conn dir base-schema)]
+    (try
+      (let [policy (:policy
+                    (d/install-write-policy! first-conn (same-entity-policy)))
+            stored (d/schema first-conn)]
+        (d/close first-conn)
+        (testing "a changed frozen attribute is rejected and named"
+          (let [data (rejected-open dir redefining-schema)]
+            (is (= :datalevin/frozen-attribute-write (:type data)))
+            (is (= #{:guarded/value} (:attributes data))))
+          (is (= stored (stored-schema dir))))
+        (testing "unchanged frozen attributes are admitted beside a new one"
+          (let [conn (d/create-conn dir grown-schema)]
+            (try
+              (let [schema (d/schema conn)]
+                (is (= stored (dissoc schema :extension/value)))
+                (is (= :db.type/string
+                       (get-in schema [:extension/value :db/valueType]))))
+              (testing "which stays outside the persisted policy"
+                (is (= policy (d/write-policy conn)))
+                (is (some? (d/transact! conn [{:extension/value "open"}]))))
+              (finally
+                (d/close conn))))))
+      (finally
+        (close-delete! first-conn dir)))))
+
+(deftest update-schema-touches-only-the-attributes-it-changes
+  (let [dir (temp-store)
+        conn (d/create-conn dir base-schema)]
+    (try
+      (let [policy (:policy
+                    (d/install-write-policy! conn (same-entity-policy)))
+            stored (d/schema conn)]
+        (testing "a changed frozen attribute is rejected and named"
+          (let [data (throwable-data
+                      #(d/update-schema conn redefining-schema))]
+            (is (= :datalevin/frozen-attribute-write (:type data)))
+            (is (= #{:guarded/value} (:attributes data))))
+          (is (= stored (d/schema conn))))
+        (testing "unchanged frozen attributes are admitted beside a new one"
+          (let [schema (d/update-schema conn grown-schema)]
+            (is (= stored (dissoc schema :extension/value)))
+            (is (= :db.type/string
+                   (get-in schema [:extension/value :db/valueType]))))
+          (testing "which stays outside the persisted policy"
+            (is (= policy (d/write-policy conn)))
+            (is (some? (d/transact! conn [{:extension/value "open"}]))))))
+      (finally
+        (close-delete! conn dir)))))
+
+(deftest retyping-a-source-touches-its-frozen-composite-tuple
+  (let [dir (temp-store)
+        conn (d/create-conn
+              dir
+              {:pair/left {:db/cardinality :db.cardinality/one}
+               :pair/right {:db/valueType :db.type/long}
+               :pair/both {:db/tupleAttrs [:pair/left :pair/right]}})]
+    (try
+      (d/install-write-policy!
+       conn
+       {:guarded-attributes #{}
+        :frozen-attributes #{:pair/both}
+        :commit-generation-attributes #{}
+        :stamp-rules []})
+      (let [data (throwable-data
+                  #(d/update-schema
+                    conn {:pair/left {:db/valueType :db.type/string}}))]
+        (is (= :datalevin/frozen-attribute-write (:type data)))
+        (is (= #{:pair/both} (:attributes data))))
+      (is (nil? (get-in (d/schema conn) [:pair/left :db/valueType])))
       (finally
         (close-delete! conn dir)))))
 

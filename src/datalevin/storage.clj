@@ -267,12 +267,14 @@
                        props)]))
         schema))
 
-(defn- schema-update-required?
+(defn- touched-schema-attrs
+  "Attributes of a prepared schema update whose effective definition differs
+  from the stored one. Applying the update touches these and no others."
   [old schema]
-  (boolean
-    (some (fn [[attr props]]
-            (not= (old attr) props))
-          (effective-schema-update old schema))))
+  (into []
+        (keep (fn [[attr props]]
+                (when (not= (old attr) props) attr)))
+        (effective-schema-update old schema)))
 
 (defn- init-schema
   [lmdb schema]
@@ -297,9 +299,10 @@
           schema       (prepare-schema-update old-schema schema)
           full-schema  (merge old-schema schema)]
       (vld/validate-schema full-schema)
-      (when (schema-update-required? old-schema schema)
-        (write-policy/assert-schema-admitted! (kv-info lmdb) (keys schema))
-        (transact-schema lmdb (update-schema old-schema schema)))))
+      (when-let [touched (seq (touched-schema-attrs old-schema schema))]
+        (write-policy/assert-schema-admitted! (kv-info lmdb) touched)
+        (transact-schema
+          lmdb (select-keys (update-schema old-schema schema) touched)))))
   (load-schema lmdb))
 
 (defn- init-attrs [schema]
@@ -768,14 +771,14 @@
                                 (not (identical? new-vt :data)))]
           ;; Re-encode stored values before persisting schema change.
           (migrate-attr-values this attr new-vt))
-        (when (schema-update-required? schema new-schema)
-          (write-policy/assert-schema-admitted!
-           (kv-info lmdb) (keys new-schema))
+        (when-let [touched (seq (touched-schema-attrs schema new-schema))]
+          (write-policy/assert-schema-admitted! (kv-info lmdb) touched)
           ;; `new-schema` is already the complete effective definition for
           ;; every updated attribute. Persist it directly so an explicitly
           ;; retracted property is not reintroduced by applying the patch a
           ;; second time.
-          (transact-schema lmdb (update-schema schema new-schema))
+          (transact-schema
+            lmdb (select-keys (update-schema schema new-schema) touched))
           (set! schema (load-schema lmdb))
           (set! rschema (schema->rschema schema))
           (set! attrs (init-attrs schema))

@@ -65,6 +65,61 @@ dynamic binding around queued transaction work:
 Normal Datalog transactions must use `tx-meta`; the administrative binding
 does not admit them.
 
+## What an operation touches
+
+The policy is checked against the attributes an operation touches, not the
+attributes it names.
+
+A transaction touches an attribute when its fully expanded datoms include a
+datom of that attribute, added or retracted.
+
+A schema operation touches an attribute when applying it would leave the
+attribute's effective definition different from the stored one:
+
+- the attribute is created, deleted, or renamed (a rename touches both
+  names);
+- one of its properties is added, changed, or retracted; or
+- it is a composite tuple attribute that has no `:db/tupleTypes` yet and
+  gains them by inference because the operation types its last untyped
+  source attribute, even though the operation does not name it.
+
+A schema map is a patch, both when it is given at open and when it is given
+to `update-schema`: properties it omits are preserved, and `:db/aid` is
+ignored. Re-declaring an attribute exactly as stored therefore touches
+nothing. Only touched attributes are checked against `:frozen-attributes`,
+and only they are written.
+
+```clojure
+;; :example/content is frozen and stored as a string.
+
+;; Admitted without the token: :example/content is re-declared unchanged, so
+;; only the new :app/note is touched.
+(d/create-conn dir {:example/content {:db/valueType :db.type/string}
+                    :app/note        {:db/valueType :db.type/string}})
+
+;; Rejected without the token: :example/content would change.
+(d/update-schema conn {:example/content {:db/cardinality :db.cardinality/many}
+                       :app/note        {:db/valueType :db.type/string}})
+```
+
+A rejected schema operation throws `:datalevin/frozen-attribute-write`, whose
+`:attributes` name the frozen attributes it was rejected for. A rejected
+schema map writes none of its attribute definitions.
+
+An attribute admitted this way is an ordinary attribute. Admission does not
+extend the persisted policy, so the attribute is neither guarded nor frozen
+until the application installs a policy that names it.
+
+The first open of a store has no token to present, because that open mints
+the token. A schema map given at open can therefore add attributes and
+re-declare frozen ones, but cannot change a frozen one. Make such a change
+after opening, under `with-write-policy-token`.
+
+Clearing or dropping a protected DBI and re-indexing act on every attribute
+at once, so they are treated as touching every frozen attribute. Their
+rejection carries the `:operation`, and the `:dbi-name` when there is one,
+instead of `:attributes`.
+
 ## Commit-generation continuity
 
 After obtaining LMDB's cross-process writer lock, every Datalog commit reads
