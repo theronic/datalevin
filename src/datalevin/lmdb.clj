@@ -127,6 +127,20 @@
   (mark-write [db] "return a new db what uses write-txn")
   (reset-write [db] "Reset buffers for writing"))
 
+(defprotocol IReadSnapshot
+  "Used to mark the DB so that all its reads use one pinned read-only txn"
+  (read-snapshot? [db] "return true if this db reads from a pinned txn")
+  (read-snapshot [db]
+    "return a new db that reads from a newly pinned read-only txn, which
+     stays open until that db is closed"))
+
+(defn single-txn?
+  "Return true if all reads of this db go through one transaction, the write
+  txn of an explicit transaction or the pinned txn of a read snapshot. Such
+  reads must not fan out to other threads."
+  [db]
+  (or (writing? db) (read-snapshot? db)))
+
 (deftype RangeContext [^boolean forward?
                        ^boolean include-start?
                        ^boolean include-stop?

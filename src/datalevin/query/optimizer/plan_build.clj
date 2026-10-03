@@ -313,7 +313,11 @@
                         mcount)
                       0)))))))
 
-(defn writing? [db] (l/writing? (.-lmdb ^Store (.-store ^DB db))))
+(defn writing?
+  "Whether the reads of `db` go through one transaction, that of an explicit
+  transaction or of a read snapshot, and so stay on the calling thread."
+  [db]
+  (l/single-txn? (.-lmdb ^Store (.-store ^DB db))))
 
 (defn- update-nodes
   [db nodes]
@@ -1685,6 +1689,8 @@
   [^PlanSource saved ^DB database]
   (let [store (.-store database)]
     (and (not (i/closed? store))
+         ;; A read snapshot plans afresh and leaves the shared plans alone.
+         (not (l/read-snapshot? (.-lmdb ^Store store)))
          (identical? (.get ^WeakReference (.-owner saved))
                       (i/kv-info (.-lmdb ^Store store)))
          (identical? (.-schema saved) (i/schema store))

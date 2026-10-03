@@ -117,6 +117,9 @@
 (defn conn-from-db
   [db]
   {:pre [(db/db? db)]}
+  (when (db/read-snapshot? db)
+    (raise "Read snapshot is read-only." {:error     :read-snapshot/read-only
+                                          :operation :conn-from-db}))
   (wrap-conn
    (atom db :meta {:listeners (atom {})
                    :db-listeners (atom {})
@@ -1002,6 +1005,36 @@
   {:pre [(conn? conn)]}
   @conn)
 
+(defn open-read-snapshot
+  [conn]
+  {:pre [(conn? conn)]}
+  (db/read-snapshot @conn))
+
+(defmacro with-read-snapshot
+  "Evaluate body with a read snapshot of a Datalog database, and close the
+  snapshot afterwards.
+
+  `db` is a new identifier of the read snapshot, a database object, and `conn`
+  is the database connection. All reads of `db` see the state that was
+  committed when the snapshot was taken, whatever is transacted in the
+  meantime. See [[open-read-snapshot]].
+
+  `body` should refer to `db`, and realize what it needs from it, e.g. the
+  attributes of an entity, as `db` cannot be read after `body` returns.
+
+  Example:
+
+          (with-read-snapshot [db conn]
+            {:max-tx (:max-tx db)
+             :names  (q '[:find [?n ...] :where [_ :name ?n]] db)
+             :ivan   (pull db '[*] [:name \"Ivan\"])}) "
+  [[db conn] & body]
+  `(let [~db (open-read-snapshot ~conn)]
+     (try
+       ~@body
+       (finally
+         (db/close-read-snapshot ~db)))))
+
 (defn opts
   [conn]
   (let [store (.-store ^DB @conn)
@@ -1013,10 +1046,10 @@
     opts))
 
 (defn schema
-  "Return the schema of Datalog DB"
-  [conn]
-  {:pre [(conn? conn)]}
-  (i/schema ^Store (.-store ^DB @conn)))
+  "Return the schema of a Datalog connection or DB"
+  [x]
+  (let [^DB db (if (db/db? x) x (db x))]
+    (i/schema ^Store (.-store db))))
 
 (defn secondary-index-status
   [conn]

@@ -189,6 +189,16 @@
   e.g. [(or (= ?g \"f\"\") (like ?n \"A%\"\"))]"
   or-fn)
 
+(defn- index-store
+  "Return the store of `db` for a search of one of its secondary indices.
+  They keep part of their state in memory and are not committed together with
+  the datoms, so a read snapshot cannot search them consistently."
+  ^Store [^DB db index]
+  (if (db/read-snapshot? db)
+    (raise "Read snapshot is not supported: " index
+           {:error :read-snapshot/unsupported :reason index})
+    (.-store db)))
+
 (defn- fulltext*
   [^FastList res aid->attr lmdb engines query opts domain ^ints needed]
   (let [engine  (engines domain)
@@ -215,7 +225,7 @@
   shared semantic boundary used by ordinary function execution and physical
   fulltext access paths."
   [^DB db arg1 arg2 arg3 ^ints needed]
-  (let [^Store store (.-store db)
+  (let [^Store store (index-store db :fulltext)
         engines      (.-search-engines store)
         attr?        (keyword? arg1)
         domains      (if attr?
@@ -332,7 +342,7 @@
   "Normalize one vector-neighbor invocation without executing its approximate
   searches."
   [^DB db arg1 arg2 arg3 ^ints needed]
-  (let [^Store store (.-store db)
+  (let [^Store store (index-store db :vector)
         indices      (.-vector-indices store)
         attr?        (keyword? arg1)
         domains      (if attr?
@@ -350,7 +360,7 @@
   "Normalize one embedding-neighbor invocation without embedding the query or
   executing its approximate searches."
   [^DB db arg1 arg2 arg3 ^ints needed]
-  (let [^Store store (.-store db)
+  (let [^Store store (index-store db :embedding)
         indices      (.-embedding-indices store)
         attr?        (keyword? arg1)
         domains      (if attr?
@@ -721,7 +731,7 @@
   Candidate preparation and tuple production are deferred to
   `execute-idoc-match-request`."
   [^DB db arg1 arg2 arg3 ^ints needed]
-  (let [^Store store (.-store db)
+  (let [^Store store (index-store db :idoc)
         indices      (st/store-idoc-indices store)
         attr?        (keyword? arg1)
         domains0     (if attr?

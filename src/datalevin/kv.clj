@@ -73,13 +73,14 @@
 (defn write-group
   "Return the admission queue for eligible standalone writes.
   The server may opt HA stores in when it retains both HA guards around the
-  physical commit. Embedded HA, explicit transactions and shared WAL stay out."
+  physical commit. Embedded HA, explicit transactions, read snapshots and
+  shared WAL stay out."
   ([db kind] (write-group db kind false))
   ([db kind ha-guarded?]
    (when (and group/*enabled?*
               (nil? cpp/*before-write-commit-fn*)
               (nil? kvtx/*after-txlog-append-fn*)
-              (not (l/writing? db))
+              (not (l/single-txn? db))
               (not (Thread/holdsLock (l/write-txn db))))
      (let [info @(i/kv-info db)
            state (:txlog-state info)]
@@ -281,6 +282,10 @@
   (write-txn [_] (l/write-txn db))
   (mark-write [_] (wrap-lmdb (l/mark-write db)))
   (reset-write [_] (wrap-lmdb (l/reset-write db)))
+
+  l/IReadSnapshot
+  (read-snapshot? [_] (l/read-snapshot? db))
+  (read-snapshot [_] (->KVLMDB (l/read-snapshot db)))
 
   i/IList
   (del-list-items

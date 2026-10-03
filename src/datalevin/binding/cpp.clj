@@ -32,18 +32,19 @@
             val-compressor set-max-val-size max-val-size
             set-key-compressor set-val-compressor]]
    [datalevin.lmdb :as l
-    :refer [open-kv IBuffer IRange IRtx IWriting ICompress]])
+    :refer [open-kv IBuffer IRange IRtx IWriting IReadSnapshot ICompress]])
   (:import
-   [datalevin.dtlvnative DTLV DTLV$MDB_envinfo DTLV$MDB_stat]
+   [datalevin.dtlvnative DTLV DTLV$MDB_envinfo DTLV$MDB_stat DTLV$MDB_txn]
    [datalevin.cpp BufVal Env Txn Dbi Cursor Stat Info Util Util$MapFullException]
    [datalevin.binding.cpp.buffer DBI]
    [datalevin.lmdb RangeContext]
    [datalevin.utl BitOps]
    [java.util.concurrent ConcurrentHashMap]
-   [java.util.concurrent.atomic AtomicBoolean]
+   [java.util.concurrent.atomic AtomicBoolean AtomicReference]
+   [java.util.concurrent.locks ReentrantLock]
    [java.lang AutoCloseable]
    [java.io File]
-   [java.util HashMap Arrays Collection List ArrayList
+   [java.util HashMap HashSet Arrays Collection List ArrayList
     Map$Entry]
    [java.nio BufferOverflowException ByteBuffer]
    [org.bytedeco.javacpp LongPointer]
@@ -450,24 +451,27 @@
               (discard-thread-reader! tl-reader reader-registry thread rtx)))
           (discard-thread-reader! tl-reader reader-registry thread rtx))))))
 
+(defn- new-reader-rtx
+  [this ^Txn txn]
+  (Rtx. this
+        txn
+        (volatile! 1)
+        (buffer/new-bufval c/+max-key-size+)
+        (buffer/new-bufval 0)
+        (buffer/new-bufval c/+max-key-size+)
+        (buffer/new-bufval c/+max-key-size+)
+        (buffer/new-bufval c/+max-key-size+)
+        (buffer/new-bufval c/+max-key-size+)
+        (bf/allocate-buffer c/+max-key-size+)
+        (bf/allocate-buffer (long (max-val-size this)))
+        (volatile! false)
+        (AtomicBoolean.)
+        true (ArrayList. 1)))
+
 (defn- fresh-reader-rtx
   [this ^Env env ^ThreadLocal tl-reader ^ConcurrentHashMap reader-registry]
-  (let [thread        (Thread/currentThread)
-        max-val-size* (long (max-val-size this))
-        rtx (Rtx. this
-                  (Txn/createReadOnly env)
-                  (volatile! 1)
-                  (buffer/new-bufval c/+max-key-size+)
-                  (buffer/new-bufval 0)
-                  (buffer/new-bufval c/+max-key-size+)
-                  (buffer/new-bufval c/+max-key-size+)
-                  (buffer/new-bufval c/+max-key-size+)
-                  (buffer/new-bufval c/+max-key-size+)
-                  (bf/allocate-buffer c/+max-key-size+)
-                  (bf/allocate-buffer max-val-size*)
-                  (volatile! false)
-                  (AtomicBoolean.)
-                  true (ArrayList. 1))]
+  (let [thread (Thread/currentThread)
+        rtx    (new-reader-rtx this (Txn/createReadOnly env))]
     (.set tl-reader rtx)
     (when-not (.isVirtual thread)
       (when-let [^Rtx old (.put reader-registry thread rtx)]
@@ -485,6 +489,94 @@
      :cause     (ex-message e)}
     e))
 
+;; A read snapshot reads through one reader that keeps its transaction until
+;; the snapshot is closed, instead of the reader of the calling thread. With
+;; MDB_NOTLS, LMDB lets such a transaction move between threads as long as one
+;; thread uses it at a time, which the lock sees to.
+(deftype PinnedReader [^Rtx rtx ^ReentrantLock lock])
+
+(defn- pinned-txn
+  "Begin the transaction of a pinned reader. It is deliberately not marked
+  read-only. The cursors of a read-only Txn are kept in per-thread pools, and
+  a cursor only works with the buffers of the reader it was opened with. The
+  pooled ones belong to the reader of their thread, not to this one. Like
+  those of a write transaction, the cursors of this one are opened and closed
+  with each use."
+  ^Txn [^Env env]
+  (let [ptr (DTLV$MDB_txn.)]
+    (Util/checkRc (DTLV/mdb_txn_begin (.get env) nil DTLV/MDB_RDONLY ptr))
+    (Txn. ptr false)))
+
+(defn- pin-reader!
+  "Open a pinned reader and register it with its environment, which closes
+  the ones still open when it is closed itself."
+  [this ^Env env info]
+  (let [^AtomicReference readers (:pinned-readers @info)]
+    (locking readers
+      (let [^HashSet open (or (.get readers)
+                              ;; taken away by a closing environment
+                              (raise "LMDB env is closed."
+                                     {:type :lmdb/closed}))
+            pinned        (try
+                            (PinnedReader.
+                              (new-reader-rtx this (pinned-txn env))
+                              (ReentrantLock.))
+                            (catch Exception e
+                              (throw (read-transaction-acquisition-error
+                                       (env-dir this) e))))]
+        (.add open pinned)
+        pinned))))
+
+(defn- check-pinned-reader
+  [^PinnedReader pinned]
+  (when (.get ^AtomicBoolean (.-closed? ^Rtx (.-rtx pinned)))
+    (raise "Read snapshot is closed." {:error :read-snapshot/closed})))
+
+(defn- borrow-pinned-reader!
+  [^PinnedReader pinned]
+  (let [^ReentrantLock lock (.-lock pinned)]
+    (.lock lock)
+    (try
+      (check-pinned-reader pinned)
+      (.-rtx pinned)
+      (catch Throwable e
+        (.unlock lock)
+        (throw e)))))
+
+(defn- close-pinned-reader!
+  "Close a pinned reader once no thread is reading through it."
+  [^PinnedReader pinned]
+  (let [^ReentrantLock lock (.-lock pinned)]
+    (.lock lock)
+    (try
+      (close-rtx-quiet! (.-rtx pinned))
+      (finally (.unlock lock)))))
+
+(defn- unpin-reader!
+  [^PinnedReader pinned info]
+  (when (.isHeldByCurrentThread ^ReentrantLock (.-lock pinned))
+    (raise "Cannot close a read snapshot from within one of its reads."
+           {:error :read-snapshot/in-use}))
+  (close-pinned-reader! pinned)
+  (let [^AtomicReference readers (:pinned-readers @info)]
+    (locking readers
+      (when-let [^HashSet open (.get readers)]
+        (.remove open pinned))))
+  nil)
+
+(defn- unpin-readers!
+  "Close the pinned readers of an environment that is about to be closed,
+  and keep it from opening any more."
+  [info]
+  (let [^AtomicReference readers (:pinned-readers @info)]
+    (doseq [pinned (locking readers (vec (.getAndSet readers nil)))]
+      (close-pinned-reader! pinned))))
+
+(defn- reject-write
+  [pinned op]
+  (when pinned
+    (raise "Read snapshot is read-only." {:error     :read-snapshot/read-only
+                                          :operation op})))
 
 (declare key-range-list-count-fast)
 
@@ -584,13 +676,31 @@
   ;; point/range/count adapter or its forwarding arities. Only these entry
   ;; points touch native handles without an existing borrow boundary.
   ;; Cleanup remains callable after fencing so existing borrows can drain.
+  ;; A read snapshot shares the environment but owns only its pinned reader.
+  ;; It rejects the entry points that write to, reconfigure or copy the
+  ;; environment, as these act on its latest state, and closing it releases
+  ;; that reader.
   (let [guarded '#{apply-native-range! open-dbi clear-dbi drop-dbi copy
-                  transact-kv set-env-flags get-env-flags sync}]
+                  transact-kv set-env-flags get-env-flags sync}
+        mutating '#{apply-native-range! open-dbi clear-dbi drop-dbi copy
+                   transact-kv set-env-flags set-max-val-size open-transact-kv
+                   close-transact-kv abort-transact-kv mark-write reset-write
+                   re-index}]
     `(deftype ~name ~fields
        ~@(map (fn [method]
-                (if (and (seq? method) (guarded (first method)))
-                  (let [[method args & body] method]
-                    `(~method ~args (native-call ~'info ~@body)))
+                (if (seq? method)
+                  (let [[op args & body] method
+                        body (if (guarded op)
+                               [`(native-call ~'info ~@body)]
+                               body)]
+                    (cond
+                      (mutating op)
+                      `(~op ~args (reject-write ~'pinned ~(keyword op)) ~@body)
+                      (= op 'close-kv)
+                      `(~op ~args (if ~'pinned
+                                    (unpin-reader! ~'pinned ~'info)
+                                    (do ~@body)))
+                      :else `(~op ~args ~@body)))
                   method)) methods))))
 
 (def-native-env CppLMDB [^Env env
@@ -609,6 +719,7 @@
                   ^:volatile-mutable ^ByteBuffer v-comp-bf-w
                   write-txn
                   writing?
+                  ^PinnedReader pinned
                   ^:volatile-mutable k-comp
                   ^:volatile-mutable v-comp
                   ^:unsynchronized-mutable meta]
@@ -697,7 +808,7 @@
     (->CppLMDB
       env info tl-reader reader-registry dbis scheduled-sync kp-w vp-w start-kp-w
       stop-kp-w start-vp-w stop-vp-w k-comp-bf-w v-comp-bf-w
-      write-txn true k-comp v-comp meta))
+      write-txn true nil k-comp v-comp meta))
 
   (reset-write
     [this]
@@ -733,6 +844,26 @@
           (when lease (.close ^AutoCloseable lease))
           (throw e)))))
 
+  IReadSnapshot
+  (read-snapshot? [_] (some? pinned))
+
+  (read-snapshot [this]
+    (.check-ready this)
+    (when-let [reason (cond
+                        pinned   :read-snapshot
+                        writing? :transaction
+                        ;; Without MDB_NOTLS, a reader slot belongs to a thread.
+                        (not-any? #{:notls} (:flags @info)) :tls-readers
+                        ;; Such a reader needs a lifetime lease, and has to
+                        ;; wait for the publication of what it sees.
+                        (:native-lifetime @info) :pending-wal)]
+      (raise "Read snapshot is not supported: " reason
+             {:error :read-snapshot/unsupported :reason reason}))
+    (->CppLMDB
+      env info tl-reader reader-registry dbis scheduled-sync kp-w vp-w start-kp-w
+      stop-kp-w start-vp-w stop-vp-w k-comp-bf-w v-comp-bf-w
+      write-txn false (pin-reader! this env info) k-comp v-comp meta))
+
   IObj
   (withMeta [this m] (set! meta m) this)
   (meta [_] meta)
@@ -762,6 +893,7 @@
           (lifecycle/unregister-shutdown-hook! dir)
           (lifecycle/stop-scheduled-sync scheduled-sync)
           (close-reader-rtxs! reader-registry)
+          (unpin-readers! info)
           (when-let [^Rtx wtxn @write-txn]
             (close-rtx-quiet! wtxn)
             (vreset! write-txn nil))
@@ -816,9 +948,14 @@
         (throw e))
       nil))))
 
-  (closed-kv? [_] (.isClosed env))
+  ;; A read snapshot is closed with its reader, which `check-ready` and
+  ;; `get-rtx` report, and does not answer for the env here. Its reads then
+  ;; all fail the same way instead of giving up quietly on a closed env, and
+  ;; closing it is not taken for closing the env.
+  (closed-kv? [_] (and (nil? pinned) (.isClosed env)))
 
   (check-ready [this]
+    (when pinned (check-pinned-reader pinned))
     (when (.closed-kv? this)
       (raise "LMDB env is closed." {:type :lmdb/closed})))
 
@@ -828,7 +965,8 @@
   (env-opts [_] (dissoc @info :compression :dbis :custom-dbis :types :custom-types-revision :custom-value-id
                        :custom-type-cache :custom-payload-dbi-open? :runtime-opts
                        :write-groups :native-lifetime :close-independent!
-                       :unpublished-reader-lsn :await-native-publication!))
+                       :unpublished-reader-lsn :await-native-publication!
+                       :pinned-readers))
 
   (dbi-opts [_ dbi-name] (get-in @info [:dbis dbi-name]))
 
@@ -990,25 +1128,30 @@
       (raise "Destination directory is not empty." {})))
 
   (get-rtx [this]
-    (borrow-reader! this env info tl-reader reader-registry true))
+    (if pinned
+      (borrow-pinned-reader! pinned)
+      (borrow-reader! this env info tl-reader reader-registry true)))
 
   (return-rtx [this rtx]
-    (let [^Rtx rtx rtx
-          ^ArrayList leases (.-native-leases rtx)
-          lease (when-not (.isEmpty leases) (.get leases (dec (.size leases))))]
-      (try
-        (when-not (.closed-kv? this)
-          (if (.isVirtual (Thread/currentThread))
-            (try
-              (close-rtx-quiet! rtx)
-              (finally (.remove tl-reader)))
-            (.reset rtx)))
-        (finally
-          ;; Virtual-thread close already released the whole borrow stack.
-          (when (and lease (not (.isEmpty leases))
-                     (identical? lease (.get leases (dec (.size leases)))))
-            (.remove leases (int (dec (.size leases))))
-            (.close ^AutoCloseable lease))))))
+    (if pinned
+      (.unlock ^ReentrantLock (.-lock pinned))
+      (let [^Rtx rtx rtx
+            ^ArrayList leases (.-native-leases rtx)
+            lease (when-not (.isEmpty leases)
+                    (.get leases (dec (.size leases))))]
+        (try
+          (when-not (.closed-kv? this)
+            (if (.isVirtual (Thread/currentThread))
+              (try
+                (close-rtx-quiet! rtx)
+                (finally (.remove tl-reader)))
+              (.reset rtx)))
+          (finally
+            ;; Virtual-thread close already released the whole borrow stack.
+            (when (and lease (not (.isEmpty leases))
+                       (identical? lease (.get leases (dec (.size leases)))))
+              (.remove leases (int (dec (.size leases))))
+              (.close ^AutoCloseable lease)))))))
 
   (stat [_]
     (native-call info
@@ -1558,6 +1701,7 @@
                                    false
                                    nil
                                    nil
+                                   nil
                                    nil)]
         (vreset! opened lmdb)
         ;; Spill collections may outlive the application database until GC.
@@ -1601,6 +1745,7 @@
         ;; from env-opts and stored metadata.
         (vswap! (.-info lmdb) assoc :custom-type-cache (atom {})
                 :write-groups (ConcurrentHashMap.)
+                :pinned-readers (AtomicReference. (HashSet.))
                 :runtime-opts runtime-opts)
         (lifecycle/register-local-kv-handle! local-handle-key (l/wrap-open-kv lmdb)))
       (catch Exception e

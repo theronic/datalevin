@@ -392,6 +392,7 @@ Only usable for debug output.
 (u/import-macro conn/with-transaction)
 (u/import-macro conn/with-conn)
 (u/import-macro conn/with-kv)
+(u/import-macro conn/with-read-snapshot)
 
 (def ^{:arglists '([]
                    [timeout-ms])
@@ -1134,15 +1135,57 @@ Only usable for debug output.
   unlisten-db! conn/unlisten-db!)
 
 (def ^{:arglists '([conn])
-       :doc      "Returns the underlying Datalog database object from a connection. Note that Datalevin does not have \"db as a value\" feature, the returned object is NOT a database value, but a reference to the database object. "}
+       :doc      "Returns the underlying Datalog database object from a connection. Note that Datalevin does not have \"db as a value\" feature, the returned object is NOT a database value, but a reference to the database object. See [[open-read-snapshot]] for an object that keeps reading one committed state."}
   db conn/db)
+
+(def ^{:arglists '([conn])
+       :doc      "Take a read snapshot of the Datalog database of a local connection, and
+  return it as a database object.
+
+  The object returned by [[db]] reads the latest committed state on each
+  read. A read snapshot reads the state that was committed when it was taken,
+  for as long as it is open and whatever is transacted in the meantime. Take
+  one when several reads have to agree with each other:
+
+      (def snapshot (open-read-snapshot conn))
+      (q '[:find (count ?e) . :where [?e :name]] snapshot)
+      (pull snapshot '[*] [:name \"Ivan\"])
+      (close-read-snapshot snapshot)
+
+  `(:max-tx snapshot)` and `(:max-eid snapshot)` are those of that state, and
+  so is the schema returned by [[schema]].
+
+  A read snapshot holds a LMDB read transaction, so it does not block writers
+  and is not blocked by them. It is read-only. Any thread may read it, one at
+  a time, and its queries run in the calling thread. Searches of fulltext,
+  vector, embedding and idoc indices are not supported, as these follow the
+  latest commit.
+
+  Close it with [[close-read-snapshot]], or use [[with-read-snapshot]]. An
+  open snapshot occupies a reader slot of the database, and keeps the space
+  of the data that was replaced after it was taken from being reused. Closing
+  the connection closes its snapshots.
+
+  Throws for a remote or HA database, for the connection of an open
+  [[with-transaction]], and when the `:notls` env flag is not set."}
+  open-read-snapshot conn/open-read-snapshot)
+
+(def ^{:arglists '([db])
+       :doc      "Close a read snapshot taken with [[open-read-snapshot]]. Reading from a
+  closed snapshot throws. Closing it again is a no-op."}
+  close-read-snapshot db/close-read-snapshot)
+
+(def ^{:arglists '([x])
+       :doc      "Return true if `x` is a Datalog database object that reads from a read
+  snapshot, see [[open-read-snapshot]]"}
+  read-snapshot? db/read-snapshot?)
 
 (def ^{:arglists '([conn])
        :doc      "Return the option map of the Datalog DB"}
   opts conn/opts)
 
-(def ^{:arglists '([conn])
-       :doc      "Return the schema of Datalog DB"}
+(def ^{:arglists '([conn-or-db])
+       :doc      "Return the schema of a Datalog connection or DB"}
   schema conn/schema)
 
 (def ^{:arglists '([conn])

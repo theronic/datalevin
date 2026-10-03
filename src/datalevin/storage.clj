@@ -180,7 +180,7 @@
   ([lmdb ^List in f]
    (scan-list-in-chunks lmdb in (.size in) f))
   ([lmdb ^List in work-count f]
-   (let [participants (if (or (lmdb/writing? lmdb)
+   (let [participants (if (or (lmdb/single-txn? lmdb)
                               (not *parallel-list-scan?*))
                         1
                         (parallel-scan-participant-count work-count))]
@@ -2843,6 +2843,59 @@
     (transfer-with-schema old lmdb
                           (if (= schema* (schema old)) (schema old) schema*)
                           false)))
+
+(defn- load-schema-state
+  "Read the schema and what a Store derives from it. A schema equal to that
+  of `old` keeps its identity, which parsed pull patterns are checked against."
+  [^Store old lmdb]
+  (let [live    (schema old)
+        schema* (load-schema lmdb)
+        schema* (if (= schema* live) live schema*)]
+    [schema* (schema->rschema schema*) (init-attrs schema*)
+     (init-max-aid schema*)]))
+
+(defn ^:no-doc read-snapshot
+  "Return a Store that reads from a read snapshot of the LMDB of `old`. Its
+  schema, transaction counter and state version are read through the snapshot,
+  so that they are coherent with its datoms. `cached` is called with that
+  version and a thunk that loads the schema state, and may instead answer
+  with what an earlier snapshot loaded at the same version.
+
+  The secondary indices are left out. They keep part of their state in memory
+  and are not committed together with the datoms."
+  [^Store old cached]
+  (when (:ha-mode (opts old))
+    (raise "Read snapshot is not supported: " :ha
+           {:error :read-snapshot/unsupported :reason :ha}))
+  (let [lmdb (lmdb/read-snapshot (.-lmdb old))]
+    (try
+      (let [version (init-state-sync-ms lmdb)
+            [schema* rschema* attrs* max-aid*]
+            (cached version #(load-schema-state old lmdb))]
+        (make-store
+          {:lmdb lmdb
+           :search-engines {}
+           :vector-indices {}
+           :embedding-indices {}
+           :idoc-indices {}
+           :embedding-providers {}
+           :counts (ConcurrentHashMap.)
+           :opts (opts old)
+           :schema schema*
+           :rschema rschema*
+           :attrs attrs*
+           :max-aid max-aid*
+           :max-gt (max-gt old)
+           :max-tx (init-max-tx lmdb)
+           :state-sync-ms version
+           :scheduled-sampling (volatile! nil)
+           :write-txn (.-write-txn old)
+           :sampling-lock (.-sampling-lock old)
+           :local-closed? false
+           :shared-dir-key nil}))
+      (catch Throwable e
+        (close-kv lmdb)
+        (throw e)))))
 
 (defn with-open-opts
   "Return a Store wrapper over the same open LMDB state but with different

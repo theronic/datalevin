@@ -264,11 +264,19 @@
   [store]
   (.isDisabled ^LRUCache (.get ^ConcurrentHashMap caches (dir store))))
 
+(defn ^:no-doc snapshot-store?
+  "Whether a store reads from a read snapshot. The caches of its directory
+  follow the latest commit, so its reads neither use nor fill them."
+  [store]
+  (and (instance? Store store)
+       (l/read-snapshot? (.-lmdb ^Store store))))
+
 (defn ^:no-doc cache-active?
   "Whether results can be retained. Zero capacity avoids the LRU monitor."
   [store]
   (let [cache ^LRUCache (.get ^ConcurrentHashMap caches (dir store))]
-    (and (pos? (.capacity cache)) (not (.isDisabled cache)))))
+    (and (not (snapshot-store? store))
+         (pos? (.capacity cache)) (not (.isDisabled cache)))))
 
 (defn disable-cache
   [store]
@@ -307,7 +315,8 @@
   [store pattern body]
   `(let [store# ~store
          cache# ^LRUCache (.get ^ConcurrentHashMap caches (dir store#))
-         cache?# (and (pos? (.capacity cache#)) (not (.isDisabled cache#)))
+         cache?# (and (not (snapshot-store? store#))
+                      (pos? (.capacity cache#)) (not (.isDisabled cache#)))
          generation# (if cache?# (.generation cache#) 0)]
      ;; A zero entry limit bypasses key construction and the LRU monitor as
      ;; well as retention. Keep the native read and transaction-overlay paths.
@@ -1284,14 +1293,55 @@
          (.-pull-readers old))
     old))
 
+(defn read-snapshot?
+  "Check if x is a DB that reads from a read snapshot"
+  [x]
+  (and (-searchable? x) (snapshot-store? (.-store ^DB x))))
+
+(defn read-snapshot
+  "Return a DB that reads the committed state of the store of `db` as of this
+  call, from a read snapshot. Its `max-tx` and `max-eid` are those of that
+  state."
+  [^DB db]
+  (let [live (.-store db)]
+    (when-not (instance? Store live)
+      (raise "Read snapshot is not supported: " :remote
+             {:error :read-snapshot/unsupported :reason :remote}))
+    (let [store ^Store (s/read-snapshot
+                         live
+                         ;; A version has one schema. Entries of the live cache
+                         ;; that carry the version are safe for a snapshot.
+                         (fn [version load]
+                           (wrap-cache live [:schema-state version] (load))))]
+      (try
+        (carry-runtime-opts
+          (DB. store
+               (init-max-eid store)
+               (max-tx store)
+               (TreeSortedSet. ^Comparator (tx-datom-comparator store :eav))
+               (TreeSortedSet. ^Comparator (tx-datom-comparator store :ave))
+               (.-pull-patterns db)
+               (.-pull-readers db))
+          db)
+        (catch Throwable e
+          (i/close-kv (.-lmdb store))
+          (throw e))))))
+
+(defn close-read-snapshot
+  "Release the read snapshot that `db` reads from"
+  [db]
+  (when-not (read-snapshot? db)
+    (raise "Expected a read snapshot" {:input db}))
+  (i/close-kv (.-lmdb ^Store (.-store ^DB db))))
+
 (defn ^:no-doc single-txn?
-  "Check if x is a DB whose reads all go through one transaction, that of an
-  explicit transaction. Such reads stay on the thread that calls them."
+  "Check if x is a DB whose reads all go through one transaction, see
+  `datalevin.lmdb/single-txn?`"
   [x]
   (and (-searchable? x)
        (let [store (.-store ^DB x)]
          (and (instance? Store store)
-              (l/writing? (.-lmdb ^Store store))))))
+              (l/single-txn? (.-lmdb ^Store store))))))
 
 (defn ^:no-doc adopt-current-db!
   "Register an already constructed current DB value without repeating the
@@ -1334,12 +1384,14 @@
         (load-datoms store batch)))))
 
 (defn close-db [^DB db]
-  (let [store ^IStore (.-store db)]
-    (stop-sampling store)
-    (remove-cache store)
-    (swap! dbs dissoc (db-name store))
-    (close store)
-    nil))
+  (if (read-snapshot? db)
+    (close-read-snapshot db)
+    (let [store ^IStore (.-store db)]
+      (stop-sampling store)
+      (remove-cache store)
+      (swap! dbs dissoc (db-name store))
+      (close store)
+      nil)))
 
 (defn- local-store
   [^DB db op]

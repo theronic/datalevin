@@ -899,8 +899,10 @@
               (butlast steps)))))
 
 (defn- writing?
+  "Whether the reads of `db` go through one transaction, that of an explicit
+  transaction or of a read snapshot, and so stay on the calling thread."
   [db]
-  (l/writing? (.-lmdb ^Store (.-store ^DB db))))
+  (l/single-txn? (.-lmdb ^Store (.-store ^DB db))))
 
 (defn- prefix-set-sink
   [^long width]
