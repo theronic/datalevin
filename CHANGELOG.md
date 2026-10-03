@@ -22,6 +22,11 @@
   this improves write throughput, particularly on server, for cases when `listen!`
   is not used.
 - [Benchmark] added YCSB benchmark.
+- [Datalog] added read snapshot, a database object that keeps reading the state
+  that was committed when it was taken, with `open-read-snapshot`,
+  `close-read-snapshot`, `with-read-snapshot` and `read-snapshot?`. `schema`
+  accepts a database object as well as a connection. Details are in the [read
+  snapshot documentation](/doc/read-snapshot.md).
 
 ### Changed
 - [Storage] update dtlvnative to 1.1.5, which uses DLMDB data format version 2,
