@@ -1034,7 +1034,12 @@
 
                 new-deltas
                 (if (> (count stratum) 1)
-                  (into {} (keep identity) (pmap eval-one stratum))
+                  (into {} (keep identity)
+                        ((if (some db/single-txn?
+                                   (vals (:sources clean-context)))
+                           map
+                           pmap)
+                         eval-one stratum))
                   (if-let [result (eval-one (first stratum))]
                     {(first result) (second result)}
                     {}))

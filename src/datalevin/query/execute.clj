@@ -365,7 +365,8 @@
                              (let [db (sources src)]
                                (for [plans components]
                                  [db (mapcat :steps plans)]))))
-                   (map+ #(apply qplan/execute-steps context %))
+                   ((if (some db/single-txn? (vals sources)) mapv map+)
+                    #(apply qplan/execute-steps context %))
                    (sort-by #(count (:tuples %)))))))
 
 (defn- resolve-late-clause

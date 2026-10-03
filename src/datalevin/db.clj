@@ -1284,6 +1284,15 @@
          (.-pull-readers old))
     old))
 
+(defn ^:no-doc single-txn?
+  "Check if x is a DB whose reads all go through one transaction, that of an
+  explicit transaction. Such reads stay on the thread that calls them."
+  [x]
+  (and (-searchable? x)
+       (let [store (.-store ^DB x)]
+         (and (instance? Store store)
+              (l/writing? (.-lmdb ^Store store))))))
+
 (defn ^:no-doc adopt-current-db!
   "Register an already constructed current DB value without repeating the
   store-open lifecycle work performed by `new-db`."

@@ -42,6 +42,8 @@
 - [Datalog] simulated transaction range bounds.
 - [KV] a cursor-lifetime bug in near-list that causes concurrent databases regression.
 - [KV] prefix overflow page deletion [#390](https://github.com/datalevin/datalevin/issues/390).
+- [Datalog] crash, hang or wrong result of a query with three or more
+  unconnected parts inside `with-transaction`.
 
 ### Improved
 - [Server] simplify, speedup and harden client/server lifecycle, by using

@@ -1593,11 +1593,12 @@
             [(component-plan-alternatives
                db sources rules nodes incoming-counts required-vars
                component deferred)])
-          (map+ (bound-fn [[component deferred]]
-                  (component-plan-alternatives
-                    db sources rules nodes incoming-counts required-vars
-                    component deferred))
-                components))]
+          ((if (writing? db) mapv map+)
+           (bound-fn [[component deferred]]
+             (component-plan-alternatives
+               db sources rules nodes incoming-counts required-vars
+               component deferred))
+           components))]
     {:plans (mapv #(annotate-reusable-sip-domains db (:plan %)) alternatives)
      :deferred deferred
      :attribute-group-planning
